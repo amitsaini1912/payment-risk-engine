@@ -214,7 +214,10 @@ def _finalize(txn_id, model_score, threshold, path_used, failure_mode,
         entry["error_detail"] = error_detail
     if llm_raw is not None:
         entry["llm_raw_output"] = llm_raw[:2000]
-    write_entry(entry, path=audit_path) if audit_path else write_entry(entry)
+    if audit_path:
+        write_entry(entry, path=audit_path)
+    else:
+        write_entry(entry)
     return result
 
 

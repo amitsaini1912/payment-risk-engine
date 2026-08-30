@@ -1,27 +1,28 @@
-# Day 1
-pandas>=2.0
-numpy>=1.24
+# Python 3.9+ . Tested on 3.9.6 (macOS).
+# Install:  python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
 
-# Day 2 (model)
-# Gradient-boosted trees come from scikit-learn's HistGradientBoostingClassifier
-# rather than xgboost, so the repo has no native OpenMP/libomp dependency and
-# clones-and-runs anywhere Python does.
-scikit-learn>=1.3
-matplotlib>=3.7
-joblib>=1.3
+# --- data + model (Day 1-2) ---
+# Gradient-boosted trees come from scikit-learn's HistGradientBoostingClassifier,
+# not xgboost, so there is no native OpenMP/libomp dependency to install.
+pandas==2.3.3
+numpy==2.0.2
+scikit-learn==1.6.1
+scipy==1.13.1
+matplotlib==3.9.4
+joblib==1.5.3
 
-# Day 3 (agent)
-# LLM reasoning uses Google Gemini (free tier). The agent is key-optional: with
-# no GEMINI_API_KEY it falls back to the deterministic rule engine.
-google-genai>=1.0
-python-dotenv>=1.0
+# --- reasoning agent (Day 3) ---
+# LLM = Google Gemini (free tier). The agent is key-optional: with no
+# GEMINI_API_KEY it uses the deterministic fallback.
+google-genai==1.47.0
+python-dotenv==1.2.1
 
-# Day 4 (service + dashboard)
-fastapi>=0.110
-uvicorn>=0.29
-streamlit>=1.33
-requests>=2.31
+# --- API + dashboard (Day 4) ---
+fastapi==0.128.8
+uvicorn==0.39.0
+streamlit==1.50.0
+requests==2.32.5
 
-# Day 5 (tests)
-pytest>=8.0
-httpx>=0.27
+# --- tests (Day 5) ---
+pytest==8.4.2
+httpx==0.28.1
