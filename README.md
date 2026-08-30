@@ -173,6 +173,32 @@ GEMINI_API_KEY=your-key-here
 # optional: GEMINI_MODEL=gemini-flash-lite-latest
 ```
 
+## API + dashboard (Day 4)
+
+```bash
+./run.sh                                  # starts API (:8000) + dashboard (:8501)
+# or separately:
+uvicorn api.main:app --port 8000
+streamlit run dashboard/app.py            # works stand-alone too (in-process fallback)
+```
+
+**FastAPI** (`api/main.py`): `POST /assess` (validates the body, returns the
+verdict, logs it), `GET /audit/{transaction_id}`, `GET /audit`, `GET /metrics`,
+`GET /health`. Bad requests get a clean `422`; `POST /assess?simulate=<mode>`
+forces a failure mode for the demo.
+
+**Streamlit dashboard** (`dashboard/app.py`) — the primary demo surface:
+
+| Panel | What it shows |
+|-------|---------------|
+| Assess a transaction | Preset + editable form → live verdict, LLM explanation, score, path, latency |
+| Simulate a failure | One button per failure mode — forces it through the real pipeline, shows the fallback verdict on screen, no crash |
+| Audit trail | Live table of recent decisions (time, score, path, failure_mode, action) |
+| Sidebar | Day-2 model recall / precision / F1 / threshold / confusion matrix / cost-per-txn |
+
+The dashboard uses the API when it's reachable and falls back to calling the
+agent in-process otherwise, so `streamlit run dashboard/app.py` alone is enough.
+
 ## Failure handling
 
 Three distinct failure modes, each with a dedicated test in
