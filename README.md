@@ -145,10 +145,69 @@ would not give that.
 
 Full numbers: `model/metrics.json`. Cost curve: `model/threshold_cost_curve.png`.
 
+## Reasoning agent (Day 3)
+
+`agent/reasoning_agent.assess(transaction)` is the single entry point:
+
+1. Score the transaction with the Day-2 model.
+2. Send the score + derived risk features to **Gemini** (`gemini-flash-lite`,
+   ~1-2s) and ask for a structured verdict — `{action, explanation, confidence}`
+   where `action ∈ {allow, hold_for_review, block}`. The LLM **decides**; it is
+   not a chatbot. Falls through a list of model ids if one is deprecated/overloaded.
+3. Enforce a hard ~8s wall-clock timeout on that call (daemon thread — a hung
+   call cannot block the decision).
+4. Validate the LLM's JSON against a strict schema.
+5. On **any** failure, fall back to `agent/fallback_rules.py` — a deterministic
+   score-band + hard-rule engine with no external dependencies.
+6. Log every decision to `logs/audit_trail.jsonl`, recording which failure (if
+   any) triggered the fallback.
+
+`assess()` never raises — a payments service must always return a verdict.
+
+The agent is **key-optional**: with no `GEMINI_API_KEY` it logs
+`failure_mode: "llm_unavailable"` and uses the fallback. To enable live LLM
+reasoning, create `.env` (gitignored) in the repo root:
+
+```
+GEMINI_API_KEY=your-key-here
+# optional: GEMINI_MODEL=gemini-flash-lite-latest
+```
+
+## Failure handling
+
+Three distinct failure modes, each with a dedicated test in
+`tests/test_failure_modes.py` and a one-click simulation on the dashboard
+(`agent/failure_sim.py`):
+
+| # | Failure | Detection | Response | `failure_mode` logged |
+|---|---------|-----------|----------|-----------------------|
+| 1 | LLM call times out / API unreachable | wall-clock timeout; connection exception | deterministic fallback | `llm_timeout`, `llm_error`, `llm_unavailable` |
+| 2 | LLM returns malformed / non-JSON output | JSON parse fails, or schema/enum invalid | deterministic fallback | `llm_malformed` |
+| 3 | Missing / corrupt input field | scorer validation (`ScoringError`) | fallback → conservative `hold_for_review`; LLM never attempted | `bad_input` |
+
+Run the simulations: `python agent/failure_sim.py all`
+
 ## Audit trail
 
-Every decision (LLM path or fallback) is appended to `logs/audit_trail.jsonl`.
-The file is gitignored; a sample entry will be shown here from Day 3.
+Every decision (LLM path or fallback) is appended to `logs/audit_trail.jsonl`
+(gitignored). Sample entry — an LLM timeout that fell back to the rule engine:
+
+```json
+{
+  "logged_at": "2026-08-30T16:38:47.246751+00:00",
+  "transaction_id": "TXN-SIM-LLM_TIMEOUT",
+  "model_score": 0.9396,
+  "threshold": 0.4237,
+  "path_used": "fallback",
+  "failure_mode": "llm_timeout",
+  "action": "block",
+  "explanation": "Deterministic fallback (llm_timeout). Action: BLOCK. IP/billing country mismatch + new device on a high-value order; model score 0.940 -> band 'block' (review>=0.42, block>=0.8).",
+  "confidence": 0.61,
+  "rules_fired": ["IP/billing country mismatch + new device on a high-value order", "model score 0.940 -> band 'block'"],
+  "feature_snapshot": { "amount": 12500, "historical_chargeback_rate": 0.25, "...": "..." },
+  "error_detail": "no response within 2.0s"
+}
+```
 
 ## Setup
 

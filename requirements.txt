@@ -11,7 +11,9 @@ matplotlib>=3.7
 joblib>=1.3
 
 # Day 3 (agent)
-anthropic>=0.40
+# LLM reasoning uses Google Gemini (free tier). The agent is key-optional: with
+# no GEMINI_API_KEY it falls back to the deterministic rule engine.
+google-genai>=1.0
 python-dotenv>=1.0
 
 # Day 4 (service + dashboard)
