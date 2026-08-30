@@ -3,8 +3,10 @@ pandas>=2.0
 numpy>=1.24
 
 # Day 2 (model)
+# Gradient-boosted trees come from scikit-learn's HistGradientBoostingClassifier
+# rather than xgboost, so the repo has no native OpenMP/libomp dependency and
+# clones-and-runs anywhere Python does.
 scikit-learn>=1.3
-xgboost>=2.0
 matplotlib>=3.7
 joblib>=1.3
 

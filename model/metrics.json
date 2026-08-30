@@ -1,0 +1,80 @@
+{
+  "dataset": {
+    "rows": 15000,
+    "chargeback_rate": 0.0663,
+    "test_rows": 3000,
+    "test_chargebacks": 199
+  },
+  "candidates_at_threshold_0.5": {
+    "logistic_regression": {
+      "avg_precision": 0.4277,
+      "roc_auc": 0.9115,
+      "precision@0.5": 0.2721,
+      "recall@0.5": 0.8191,
+      "f1@0.5": 0.4085
+    },
+    "random_forest": {
+      "avg_precision": 0.3879,
+      "roc_auc": 0.9192,
+      "precision@0.5": 0.3458,
+      "recall@0.5": 0.7437,
+      "f1@0.5": 0.4721
+    },
+    "hist_gradient_boosting": {
+      "avg_precision": 0.4568,
+      "roc_auc": 0.9211,
+      "precision@0.5": 0.3296,
+      "recall@0.5": 0.8844,
+      "f1@0.5": 0.4802
+    }
+  },
+  "selected_model": "hist_gradient_boosting",
+  "selected": {
+    "threshold": 0.4237,
+    "threshold_rationale": "cost-minimising threshold on the held-out test set, subject to a precision floor of 0.3 (manual-review capacity constraint). See threshold_analysis.py.",
+    "threshold_unconstrained": {
+      "threshold": 0.271,
+      "precision": 0.2821,
+      "recall": 0.9497,
+      "total_cost_inr": 245073.7
+    },
+    "precision_floor": 0.3,
+    "precision": 0.3129,
+    "recall": 0.9246,
+    "f1": 0.4676,
+    "avg_precision": 0.4568,
+    "roc_auc": 0.9211,
+    "confusion_matrix": {
+      "tn": 2397,
+      "fp": 404,
+      "fn": 15,
+      "tp": 184
+    },
+    "cost": {
+      "assumptions_inr": {
+        "fn_dispute_fee": 1500.0,
+        "fn_ops_cost": 500.0,
+        "fn_amount": "actual transaction amount",
+        "fp_review_cost": 400.0
+      },
+      "total_cost_at_threshold_inr": 264908.95,
+      "cost_per_txn_inr": 88.3,
+      "baseline_cost_approve_all_inr": 2807214.5,
+      "baseline_cost_review_all_inr": 1120400.0
+    }
+  },
+  "top_feature_importances": {
+    "amount": 0.1362,
+    "historical_chargeback_rate": 0.1308,
+    "amount_to_avg_ratio": 0.1055,
+    "txn_count_1h": 0.0853,
+    "past_chargebacks": 0.0403,
+    "ip_billing_country_mismatch": 0.0346,
+    "card_type": 0.0177,
+    "is_new_device": 0.0107,
+    "is_international_card": 0.0077,
+    "hour": 0.0068,
+    "account_age_days": 0.0065,
+    "email_is_disposable": 0.0024
+  }
+}

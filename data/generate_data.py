@@ -30,7 +30,7 @@ import pandas as pd
 # Configuration
 # ---------------------------------------------------------------------------
 
-BASE_CHARGEBACK_PROB = 0.012          # everyone starts here (~1.2%)
+BASE_CHARGEBACK_PROB = 0.003          # a transaction with NO pattern (~0.3%)
 TARGET_RATE_RANGE = (0.02, 0.08)      # acceptance bar for the overall rate
 
 PAYMENT_METHODS = ["card", "upi", "netbanking", "wallet", "emi"]
@@ -55,81 +55,96 @@ COUNTRY_WEIGHTS = [0.82, 0.05, 0.03, 0.03, 0.02, 0.02, 0.015, 0.015]
 # ---------------------------------------------------------------------------
 # Hand-crafted fraud patterns
 # ---------------------------------------------------------------------------
-# Each pattern is a function row -> multiplicative lift on the chargeback prob.
-# A lift of 1.0 means "no effect". These are the ONLY things (besides the base
-# rate and a little noise) that drive the label.
+# Each pattern is a function row -> (lift, floor):
+#   lift  - multiplicative bump on the running chargeback probability
+#   floor - a minimum probability this pattern imposes (0.0 = none)
+# The floor is what makes strong patterns genuinely LEARNABLE: when a
+# stolen-card signature fires, the transaction really is high-risk, not just
+# "base rate times a number". These (plus the base rate and a little noise) are
+# the ONLY things that drive the label.
 
-def pattern_new_account_high_value_odd_hour(r) -> float:
+def pattern_new_account_high_value_odd_hour(r):
     """P1: brand-new account buys something expensive in the middle of the night.
     Classic stolen-card 'cash out fast' behaviour."""
-    if r["account_age_days"] <= 30 and r["amount"] >= 15000 and (
-        r["hour"] >= 23 or r["hour"] <= 5
-    ):
-        return 12.0
-    if r["account_age_days"] <= 30 and r["amount"] >= 15000:
-        return 4.5
-    return 1.0
+    new = r["account_age_days"] <= 30
+    big = r["amount"] >= 15000
+    odd = r["hour"] >= 23 or r["hour"] <= 5
+    if new and big and odd:
+        return 15.0, 0.80
+    if new and big:
+        return 5.0, 0.35
+    return 1.0, 0.0
 
 
-def pattern_repeat_chargeback_customer(r) -> float:
+def pattern_repeat_chargeback_customer(r):
     """P2: this customer has disputed transactions before. Strong recidivism
     signal - both for genuine 'friendly fraud' and for compromised accounts."""
     if r["past_chargebacks"] >= 3:
-        return 9.0
+        return 9.0, 0.65
     if r["past_chargebacks"] == 2:
-        return 5.0
+        return 6.0, 0.45
     if r["past_chargebacks"] == 1:
-        return 2.5
-    return 1.0
+        return 3.0, 0.18
+    return 1.0, 0.0
 
 
-def pattern_card_testing_velocity(r) -> float:
+def pattern_card_testing_velocity(r):
     """P3: many transactions from the same customer in the last hour, each small.
     Looks like an attacker testing a list of stolen card numbers."""
-    if r["txn_count_1h"] >= 6 and r["amount"] <= 800:
-        return 8.0
+    if r["txn_count_1h"] >= 6 and r["amount"] <= 900:
+        return 8.0, 0.65
     if r["txn_count_1h"] >= 4 and r["amount"] <= 1500:
-        return 3.0
-    return 1.0
+        return 3.5, 0.28
+    return 1.0, 0.0
 
 
-def pattern_geo_mismatch_new_device(r) -> float:
-    """P4: the IP country does not match the billing country, and the purchase
-    is from a device we've never seen for this customer."""
-    lift = 1.0
+def pattern_geo_mismatch_new_device(r):
+    """P4: the IP country does not match the billing country, and/or the purchase
+    is from a device we've never seen for this customer on a high-value buy."""
+    lift, floor = 1.0, 0.0
+    if r["ip_billing_country_mismatch"] == 1 and r["is_new_device"] == 1 and r["amount"] >= 5000:
+        return 8.0, 0.65
     if r["ip_billing_country_mismatch"] == 1:
-        lift *= 3.5
+        lift *= 4.0
+        floor = max(floor, 0.32)
     if r["is_new_device"] == 1 and r["amount"] >= 5000:
-        lift *= 2.2
-    return lift
+        lift *= 2.5
+        floor = max(floor, 0.18)
+    return lift, floor
 
 
-def pattern_high_risk_instrument(r) -> float:
+def pattern_high_risk_instrument(r):
     """P5: prepaid or international card + high value. Prepaid cards are anonymous
     and international cards are slow/hard to recover from."""
-    lift = 1.0
+    lift, floor = 1.0, 0.0
     if r["card_type"] == "prepaid" and r["amount"] >= 8000:
-        lift *= 3.0
+        lift *= 3.5
+        floor = max(floor, 0.50)
     if r["is_international_card"] == 1 and r["amount"] >= 8000:
-        lift *= 2.5
-    return lift
+        lift *= 3.0
+        floor = max(floor, 0.50)
+    return lift, floor
 
 
-def pattern_amount_spike_vs_history(r) -> float:
+def pattern_amount_spike_vs_history(r):
     """P6: the transaction is far larger than this customer's normal order value.
     Sudden spend spikes are a takeover tell."""
-    if r["avg_order_value"] > 0:
-        ratio = r["amount"] / r["avg_order_value"]
-        if ratio >= 10:
-            return 3.2
-        if ratio >= 5:
-            return 1.8
-    return 1.0
+    ratio = r["amount"] / r["avg_order_value"] if r["avg_order_value"] > 0 else 1.0
+    if ratio >= 12:
+        return 4.0, 0.45
+    if ratio >= 6:
+        return 2.2, 0.16
+    return 1.0, 0.0
 
 
-def pattern_disposable_email(r) -> float:
-    """P7: signed up with a throwaway email domain."""
-    return 2.0 if r["email_is_disposable"] == 1 else 1.0
+def pattern_disposable_email(r):
+    """P7: signed up with a throwaway email domain. On its own a weak signal;
+    compounds sharply with a high-value order."""
+    if r["email_is_disposable"] == 1 and r["amount"] >= 6000:
+        return 3.5, 0.40
+    if r["email_is_disposable"] == 1:
+        return 2.2, 0.08
+    return 1.0, 0.0
 
 
 PATTERNS = [
@@ -159,8 +174,8 @@ def _make_customers(n_customers: int, rng: random.Random) -> dict:
         cid = f"C{100000 + i}"
         account_age = int(np.clip(rng.lognormvariate(4.8, 1.1), 1, 3000))
         # Most customers never charge back; a few are repeat offenders.
-        past_cb = np.random.poisson(0.15)
-        if rng.random() < 0.03:
+        past_cb = np.random.poisson(0.06)
+        if rng.random() < 0.02:
             past_cb += rng.randint(1, 4)
         past_orders = int(np.clip(rng.lognormvariate(1.6, 1.0), 0, 400))
         avg_order_value = round(float(np.clip(rng.lognormvariate(7.4, 0.7), 100, 60000)), 2)
@@ -169,7 +184,7 @@ def _make_customers(n_customers: int, rng: random.Random) -> dict:
             "past_chargebacks": int(past_cb),
             "past_orders": past_orders,
             "avg_order_value": avg_order_value,
-            "email_is_disposable": 1 if rng.random() < 0.04 else 0,
+            "email_is_disposable": 1 if rng.random() < 0.03 else 0,
             "home_country": np.random.choice(COUNTRIES, p=COUNTRY_WEIGHTS),
         }
     return customers
@@ -233,7 +248,7 @@ def generate(rows: int, seed: int) -> pd.DataFrame:
         base_amt = cust["avg_order_value"]
         if forced:
             amount = forced[2]
-        elif rng.random() < 0.08:
+        elif rng.random() < 0.06:
             amount = base_amt * rng.uniform(4, 18)
         else:
             amount = base_amt * rng.uniform(0.2, 2.5)
@@ -282,14 +297,17 @@ def generate(rows: int, seed: int) -> pd.DataFrame:
 
         # --- build the true chargeback probability from the patterns ---
         prob = BASE_CHARGEBACK_PROB * CATEGORY_RISK[merch["category"]]
+        floor = 0.0
         fired = []
         for name, fn in PATTERNS:
-            lift = fn(row)
-            if lift > 1.0:
+            lift, patt_floor = fn(row)
+            if lift > 1.0 or patt_floor > 0.0:
                 fired.append(name)
             prob *= lift
+            floor = max(floor, patt_floor)
+        prob = max(prob, floor)
         # a little irreducible noise so the problem isn't perfectly separable
-        prob *= rng.uniform(0.7, 1.3)
+        prob *= rng.uniform(0.85, 1.15)
         prob = float(np.clip(prob, 0.0, 0.95))
 
         row["_true_prob"] = round(prob, 5)

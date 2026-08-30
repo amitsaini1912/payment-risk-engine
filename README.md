@@ -97,6 +97,54 @@ model; pass `--keep-debug-cols` to inspect them.
 | `email_is_disposable` | int | 1 if the signup email domain is a known throwaway provider |
 | `is_chargeback` | int | **Label.** 1 if the transaction was later charged back |
 
+## Model (Day 2)
+
+Baseline-first: Logistic Regression → Random Forest → Histogram Gradient
+Boosting, all with balanced class weights. The model with the best average
+precision (area under the PR curve) is selected — **HistGradientBoosting**,
+AP ≈ 0.46, ROC-AUC ≈ 0.92 on a stratified 20% held-out test set.
+
+Regenerate:
+
+```bash
+python model/train.py                 # writes model/model.pkl + model/metrics.json
+python model/threshold_analysis.py    # standalone cost-vs-threshold report + plot
+```
+
+### Cost-based decision threshold
+
+The threshold is not eyeballed. `model/threshold_analysis.py` sweeps every
+threshold and computes total expected rupee cost:
+
+| Mistake | Cost |
+|---------|------|
+| Missed chargeback (FN) | transaction amount + ₹1,500 dispute fee + ₹500 ops |
+| False alarm (FP) | ₹400 manual review + friction |
+
+The **unconstrained** cost minimum is threshold ≈ 0.27 (recall 0.95, precision
+0.28). Because manual-review capacity is finite and precision below ~30% wastes
+reviewer time, we impose a **0.30 precision floor**. The cost-minimising
+threshold under that constraint is **0.42**, costing only ~8% more than the
+unconstrained optimum.
+
+### Metrics at the shipped threshold (0.42)
+
+| Metric | Value |
+|--------|-------|
+| Recall | **0.92** (acceptance bar ≥ 0.75) |
+| Precision | 0.31 |
+| F1 | 0.47 |
+| Confusion (test, n=3000) | TP 184 · FP 404 · FN 15 · TN 2397 |
+| Expected cost | ₹88 / txn vs ₹936 / txn if we approve everything (−91%) |
+
+Top drivers (permutation importance): transaction `amount`,
+`historical_chargeback_rate`, `amount_to_avg_ratio`, `txn_count_1h` (velocity),
+`past_chargebacks`, `ip_billing_country_mismatch`. A tree model is chosen partly
+so a flagged transaction can be explained by naming these inputs — a neural net
+would not give that.
+
+Full numbers: `model/metrics.json`. Cost curve: `model/threshold_cost_curve.png`.
+
 ## Audit trail
 
 Every decision (LLM path or fallback) is appended to `logs/audit_trail.jsonl`.
