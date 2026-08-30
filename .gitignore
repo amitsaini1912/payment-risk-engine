@@ -1,0 +1,22 @@
+# --- Buildathon rules: never push learning notes ---
+learning_notes/
+
+# --- Python ---
+__pycache__/
+*.pyc
+.env
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# --- Model artifacts (regenerate via model/train.py) ---
+model/model.pkl
+
+# --- Runtime logs (sample entry shown in README) ---
+logs/*.jsonl
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
