@@ -6,7 +6,7 @@ Given a raw transaction, it:
   2. Asks an LLM (Gemini flash-lite) for a STRUCTURED verdict - action +
      explanation + confidence - passing the score and the derived risk features
      as context. The LLM *decides*; it is not a chatbot.
-  3. Enforces a hard ~8s wall-clock timeout on that call.
+  3. Enforces a hard ~35s wall-clock timeout on that call.
   4. Validates the LLM's JSON against a strict schema.
   5. On ANY failure (timeout, unreachable, malformed output, un-scorable input)
      falls back to the deterministic rule engine.
@@ -34,7 +34,7 @@ from fallback_rules import VALID_ACTIONS, decide as fallback_decide  # noqa: E40
 from llm_client import LLMError, LLMUnavailable, call_gemini  # noqa: E402
 from scorer import ScoringError, load_scorer  # noqa: E402
 
-DEFAULT_TIMEOUT_S = 8.0
+DEFAULT_TIMEOUT_S = 35.0
 
 _PROMPT = """You are a payment-risk decision agent for a payment gateway. Decide \
 what to do with ONE transaction.

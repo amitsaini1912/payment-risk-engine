@@ -60,7 +60,7 @@ def call_assess(payload: dict, simulate: str | None = None) -> dict:
     health = _api_alive()
     if health is not None:
         params = {"simulate": simulate} if simulate else None
-        r = requests.post(f"{API_URL}/assess", json=payload, params=params, timeout=30)
+        r = requests.post(f"{API_URL}/assess", json=payload, params=params, timeout=45)
         r.raise_for_status()
         return r.json()
     assess, sims = _in_process()
@@ -310,11 +310,11 @@ with tab_audit:
                    f"{(show['path'] == 'fallback').sum()} via fallback")
 
 # --------------------------------------------------------------------------
-# Sidebar: Day-2 model metrics
+# Sidebar: model metrics
 # --------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("Model metrics (Day 2)")
+    st.header("Model metrics")
     m = load_metrics()
     sel = m.get("selected", {})
     if sel:
