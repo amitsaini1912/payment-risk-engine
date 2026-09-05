@@ -8,6 +8,9 @@ import sys
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# ROOT first so `import api.main` resolves when pytest is invoked as `pytest`
+# (not just `python -m pytest`, which adds the cwd for you).
+sys.path.insert(0, ROOT)
 for sub in ("agent", "model", "api"):
     sys.path.insert(0, os.path.join(ROOT, sub))
 

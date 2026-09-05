@@ -10,6 +10,8 @@ the whole thing is driven from a live dashboard.
 
 ---
 
+**Demo video:** https://drive.google.com/file/d/10b1Q4O3ro8oGWHSt1Qu3MaBtCnVIqIvw/view?usp=sharing
+
 ## The problem, and why it's real
 
 The AI Risk Manager track asks for an agent that assesses transaction risk,
