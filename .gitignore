@@ -10,6 +10,9 @@ venv/
 *.egg-info/
 .pytest_cache/
 
+# --- Generated dataset (regenerate via data/generate_data.py) ---
+data/transactions.csv
+
 # --- Model artifacts (regenerate via model/train.py) ---
 model/model.pkl
 
