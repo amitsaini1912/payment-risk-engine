@@ -26,6 +26,9 @@ requests==2.32.5
 # --- /v2/assess feature store (Portfolio Day 14): velocity + profiles in Redis ---
 redis==5.2.1
 
+# --- /v2 rules engine (Portfolio Day 15): rules.yaml, loaded with yaml.safe_load only ---
+PyYAML==6.0.2
+
 # --- tests (Day 5) ---
 pytest==8.4.2
 httpx==0.28.1

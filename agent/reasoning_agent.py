@@ -184,10 +184,10 @@ def assess(transaction: dict, *, llm_fn=None, timeout_s: float = DEFAULT_TIMEOUT
         except (ValueError, json.JSONDecodeError) as exc:
             failure_mode = "llm_malformed"
             error_detail = str(exc)
-            verdict = fallback_decide(txn, model_score, f"llm_malformed: {exc}")
+            verdict = fallback_decide(txn, model_score, f"llm_malformed: {exc}", review_at=threshold)
     else:
         verdict = fallback_decide(
-            txn, model_score, failure_mode or "llm_unavailable"
+            txn, model_score, failure_mode or "llm_unavailable", review_at=threshold
         )
 
     return _finalize(txn_id, model_score, threshold, path_used, failure_mode,

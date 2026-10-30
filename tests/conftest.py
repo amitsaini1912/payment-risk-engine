@@ -67,3 +67,71 @@ def high_risk_transaction() -> dict:
 @pytest.fixture
 def audit_path(tmp_path) -> str:
     return str(tmp_path / "audit_trail.jsonl")
+
+
+# ---- /v2: real Redis 7 (Testcontainers, one per test session), fake clock, a copy of rules.yaml ----
+
+@pytest.fixture(scope="session")
+def redis_client():
+    import redis as redis_lib
+    try:
+        from testcontainers.redis import RedisContainer
+        container = RedisContainer("redis:7.4-alpine")
+        container.start()
+    except Exception as exc:  # noqa: BLE001 - no Docker on this machine
+        pytest.skip(f"Docker/Testcontainers not available: {exc}")
+    host, port = container.get_container_host_ip(), container.get_exposed_port(6379)
+    client = redis_lib.Redis(host=host, port=int(port), decode_responses=True)
+    yield client
+    container.stop()
+
+
+@pytest.fixture
+def clock():
+    from v2_support import FakeClock
+    return FakeClock()
+
+
+@pytest.fixture
+def store(redis_client, clock):
+    from risk_v2.store import FeatureStore
+    redis_client.flushdb()
+    return FeatureStore(redis_client, clock=clock)
+
+
+@pytest.fixture
+def rules_path(tmp_path) -> str:
+    """A private copy of the real rules.yaml, so a test can edit it (hot reload) without touching the repo."""
+    import shutil
+    path = tmp_path / "rules.yaml"
+    shutil.copy(os.path.join(ROOT, "rules.yaml"), path)
+    return str(path)
+
+
+@pytest.fixture
+def explainer():
+    """The LLM is off in tests: explanations come from the template. Tests that need an LLM replace it."""
+    from llm_client import LLMUnavailable
+
+    def _no_llm(_prompt):
+        raise LLMUnavailable("disabled in tests")
+    return {"fn": _no_llm}
+
+
+@pytest.fixture
+def v2_client(store, rules_path, explainer, tmp_path, monkeypatch):
+    if not os.path.exists(os.path.join(ROOT, "model", "model.pkl")):
+        pytest.skip("model/model.pkl not built - run `python model/train.py`")
+    from fastapi.testclient import TestClient
+
+    import audit
+    from api.main import app, get_explainer, get_feature_store, get_rule_loader
+    from risk_v2.rules import RuleLoader
+
+    monkeypatch.setattr(audit, "DEFAULT_PATH", str(tmp_path / "audit.jsonl"))
+    loader = RuleLoader(rules_path)
+    app.dependency_overrides[get_feature_store] = lambda: store
+    app.dependency_overrides[get_rule_loader] = lambda: loader
+    app.dependency_overrides[get_explainer] = lambda: explainer["fn"]
+    yield TestClient(app)
+    app.dependency_overrides.clear()

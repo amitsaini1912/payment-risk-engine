@@ -6,23 +6,29 @@ Used automatically whenever the LLM path cannot produce a valid verdict
 score. It is intentionally simple, fully explainable, and has no external
 dependencies - so it cannot itself fail for the reasons the LLM path can.
 
-Design: score bands anchored on the cost-based threshold from Day 2 (0.42),
-plus a few hard rules that fire regardless of the model score.
+Design: score bands anchored on the cost-based threshold shipped in the model
+bundle (model.pkl), plus a few hard rules that fire regardless of the model score.
 """
 
 from __future__ import annotations
 
 VALID_ACTIONS = ("allow", "hold_for_review", "block")
 
-# Score bands. `review_at` is the model's shipped threshold; `block_at` is a
-# higher band where we skip manual review and decline outright.
-REVIEW_AT = 0.42
+# Score bands. The review band starts at the threshold the caller got from the
+# model bundle (`review_at`): one source of truth - it used to be a hand-copied
+# 0.42 here (weakness #19). `BLOCK_AT` is a higher band where we skip manual
+# review and decline outright (/v2 reads its own from rules.yaml).
 BLOCK_AT = 0.80
 
 
 def decide(transaction: dict, model_score: float | None,
-           reason_for_fallback: str) -> dict:
-    """Return a verdict dict: {action, explanation, confidence, rules_fired}."""
+           reason_for_fallback: str, review_at: float | None = None) -> dict:
+    """Return a verdict dict: {action, explanation, confidence, rules_fired}.
+
+    `review_at` (the model's threshold) is required whenever `model_score` is given.
+    """
+    if model_score is not None and review_at is None:
+        raise ValueError("review_at (the model bundle's threshold) is required with a model score")
     rules_fired: list[str] = []
     txn = transaction or {}
 
@@ -67,18 +73,19 @@ def decide(transaction: dict, model_score: float | None,
         band_action = "hold_for_review"
         confidence = 0.4
     else:
-        if model_score >= BLOCK_AT:
+        block_at = max(BLOCK_AT, review_at)
+        if model_score >= block_at:
             band_action = "block"
-        elif model_score >= REVIEW_AT:
+        elif model_score >= review_at:
             band_action = "hold_for_review"
         else:
             band_action = "allow"
         rules_fired.append(
             f"model score {model_score:.3f} -> band '{band_action}' "
-            f"(review>={REVIEW_AT}, block>={BLOCK_AT})"
+            f"(review>={review_at}, block>={block_at})"
         )
         # confidence: distance from the nearest band edge
-        edges = [0.0, REVIEW_AT, BLOCK_AT, 1.0]
+        edges = [0.0, review_at, block_at, 1.0]
         nearest = min(abs(model_score - e) for e in edges)
         confidence = round(min(0.95, 0.55 + nearest), 2)
 

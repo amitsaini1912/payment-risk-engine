@@ -2,7 +2,8 @@
 FastAPI service exposing the risk agent.
 
   POST /assess              transaction -> verdict (also written to the audit trail)
-  POST /v2/assess           FACTS from billing -> engine computes velocity/profile itself (Redis) -> verdict
+  POST /v2/assess           FACTS from billing -> engine computes velocity/profile itself (Redis) -> rules (rules.yaml)
+                            + model -> verdict with reason codes
   GET  /audit/{txn_id}      retrieve the logged decision for a transaction
   GET  /audit               recent decisions (dashboard convenience)
   GET  /metrics             Day-2 model metrics
@@ -17,7 +18,7 @@ from __future__ import annotations
 import os
 import sys
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -33,6 +34,8 @@ from llm_client import DEFAULT_MODEL, is_configured  # noqa: E402
 from reasoning_agent import assess  # noqa: E402
 from risk_v2.assembler import UnsupportedCurrency, amount_in_inr_minor, to_model_transaction  # noqa: E402
 from risk_v2.contract import AssessV2Request  # noqa: E402
+from risk_v2.decision import decide  # noqa: E402
+from risk_v2.rules import RuleBook, RuleLoader, RulesUnavailable  # noqa: E402
 from risk_v2.store import FeatureStore, FeaturesUnavailable  # noqa: E402
 
 app = FastAPI(
@@ -96,12 +99,26 @@ class Verdict(BaseModel):
     feature_snapshot: dict
 
 
+_rule_loader = RuleLoader(os.environ.get("RULES_PATH", os.path.join(_ROOT, "rules.yaml")))
+
+
+def get_rule_loader() -> RuleLoader:
+    """rules.yaml (RULES_PATH), reloaded when the file changes. Tests override this."""
+    return _rule_loader
+
+
 @app.get("/health")
-def health() -> dict:
+def health(loader: RuleLoader = Depends(get_rule_loader)) -> dict:
+    try:
+        rules_version = loader.get().version
+    except RulesUnavailable:
+        rules_version = None
     return {
         "status": "ok",
         "llm_configured": is_configured(),
         "llm_model": DEFAULT_MODEL if is_configured() else None,
+        "rules_version": rules_version,   # the version /v2 decisions use right now
+        "rules_error": loader.last_error,  # why the newest rules.yaml was rejected (the old version keeps running)
     }
 
 
@@ -140,8 +157,24 @@ def assess_transaction(txn: TransactionIn, simulate: Optional[str] = None) -> di
         raise HTTPException(status_code=500, detail=f"assessment failed: {exc}") from exc
 
 
-class VerdictV2(Verdict):
+class VerdictV2(BaseModel):
     api_version: str
+    transaction_id: str
+    action: str                      # allow | hold_for_review | block - decided by rules + model, never the LLM
+    reason_codes: list[str]          # fixed codes (risk_v2/reason_codes.py), most decisive first
+    reasons: list[dict]              # each code with its source (rule / model / engine) and evidence
+    rules_fired: list[str]
+    rules_version: str
+    model_score: Optional[float]
+    threshold: Optional[float]       # review band start = the model bundle's threshold
+    block_at: float
+    model_contributions: dict        # reason code -> how much it raised the score (risk_v2/contributions.py)
+    path_used: str                   # rules+model | rules_only (model could not score)
+    failure_mode: Optional[str]
+    explanation: str
+    explanation_source: str          # llm | template | codes (the template itself failed)
+    confidence: float
+    feature_snapshot: dict
     signals: dict      # what the engine computed itself (velocity, profile, card) - see docs/adr/0001
     model_input: dict  # the exact raw transaction the model scored (facts + signals mapped to its features)
 
@@ -157,12 +190,27 @@ def get_feature_store() -> FeatureStore:
     return _feature_store
 
 
+def get_explainer() -> Optional[Callable[[str], str]]:
+    """The LLM call for explanations; None = Gemini if a key is set, else the template. Tests override this."""
+    return None
+
+
+def get_rulebook(loader: RuleLoader = Depends(get_rule_loader)) -> RuleBook:
+    try:
+        return loader.get()
+    except RulesUnavailable as exc:
+        raise HTTPException(status_code=503, detail="risk rules unavailable, use fallback") from exc
+
+
 @app.post("/v2/assess", response_model=VerdictV2)
-def assess_v2(req: AssessV2Request, store: FeatureStore = Depends(get_feature_store)) -> dict:
+def assess_v2(req: AssessV2Request, store: FeatureStore = Depends(get_feature_store),
+              book: RuleBook = Depends(get_rulebook),
+              explainer: Optional[Callable[[str], str]] = Depends(get_explainer)) -> dict:
     """Billing sends facts; every risk feature is computed here (weakness #14). Old /assess is unchanged.
 
-    422: invalid facts or an unsupported currency. 503: the feature store (Redis) is unavailable - we never score
-    with made-up "0 earlier payments" velocity; the caller uses its own fallback.
+    Pipeline (docs/adr/0002): rules.yaml -> model + per-reason contributions -> strictest action -> explanation.
+    422: invalid facts or an unsupported currency. 503: the feature store (Redis) or the rules are unavailable -
+    we never score with made-up "0 earlier payments" velocity; the caller uses its own fallback.
     """
     try:
         inr_minor = amount_in_inr_minor(req.amount_minor, req.currency)
@@ -175,7 +223,7 @@ def assess_v2(req: AssessV2Request, store: FeatureStore = Depends(get_feature_st
     except FeaturesUnavailable as exc:
         raise HTTPException(status_code=503, detail="risk features unavailable, use fallback") from exc
     model_input = to_model_transaction(req, signals, inr_minor)
-    verdict = assess(model_input)
+    verdict = decide(req, signals, model_input, book, llm_fn=explainer)
     return {**verdict, "api_version": "v2", "signals": signals.as_dict(), "model_input": model_input}
 
 

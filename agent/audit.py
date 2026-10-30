@@ -27,9 +27,16 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def write_entry(entry: dict, path: str = DEFAULT_PATH) -> dict:
+def _path(path: str | None) -> str:
+    # resolved at call time, not def time: tests (and callers) that set DEFAULT_PATH must actually redirect
+    # the writes - before Day 15 the test suite appended to the real logs/audit_trail.jsonl
+    return path or DEFAULT_PATH
+
+
+def write_entry(entry: dict, path: str | None = None) -> dict:
     """Append one entry. Never raises to the caller - a logging failure must not
     take down the decision path - but it does record that logging failed."""
+    path = _path(path)
     record = {"logged_at": _utcnow(), **entry}
     line = json.dumps(record, default=str)
     try:
@@ -41,7 +48,8 @@ def write_entry(entry: dict, path: str = DEFAULT_PATH) -> dict:
     return record
 
 
-def read_all(path: str = DEFAULT_PATH) -> list[dict]:
+def read_all(path: str | None = None) -> list[dict]:
+    path = _path(path)
     if not os.path.exists(path):
         return []
     out = []
@@ -57,11 +65,11 @@ def read_all(path: str = DEFAULT_PATH) -> list[dict]:
     return out
 
 
-def get_by_transaction_id(transaction_id: str, path: str = DEFAULT_PATH) -> dict | None:
+def get_by_transaction_id(transaction_id: str, path: str | None = None) -> dict | None:
     """Most recent entry for a transaction id, or None."""
     matches = [e for e in read_all(path) if e.get("transaction_id") == transaction_id]
     return matches[-1] if matches else None
 
 
-def recent(n: int = 25, path: str = DEFAULT_PATH) -> list[dict]:
+def recent(n: int = 25, path: str | None = None) -> list[dict]:
     return read_all(path)[-n:][::-1]

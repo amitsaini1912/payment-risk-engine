@@ -1,0 +1,88 @@
+# Risk rules for /v2/assess (docs/adr/0002, engine: risk_v2/rules.py).
+#
+# Reloaded while the engine runs: save a change and the next request uses it (see rules_version in the response
+# and /health). A file with ANY error is rejected whole and the last good version keeps running; /health shows
+# the error. Change it safely: write a copy, then `mv` it over this file (an atomic rename; a half-written file
+# could otherwise parse as a shorter, valid rule list).
+#
+# Fields, operators and reason codes are checked when the file loads: a typo is an error, not a rule that never
+# fires. Counts and sums are of EARLIER payments; distinct devices/IPs include this one. Amounts are INR.
+# Rules can only make the decision stricter: the final action is the strictest of the rules and the model.
+
+model:
+  block_at: 0.80              # model score at or above -> block. Review threshold = the model bundle's threshold
+  reasons:
+    min_contribution: 0.02    # report a model reason only if it moves the score by at least this much
+    max_reasons: 3
+
+rules:
+  - id: card_testing
+    description: 6th+ small payment on one card within an hour - testing a stolen card
+    action: block
+    reasons: [R01_VELOCITY]
+    when:
+      all:
+        - {field: card_txn_count_1h, op: ">=", value: 5}
+        - {field: amount_inr, op: "<=", value: 2000}
+
+  - id: card_velocity
+    description: 4th+ payment on one card within an hour
+    action: hold_for_review
+    reasons: [R01_VELOCITY]
+    when: {field: card_txn_count_1h, op: ">=", value: 3}
+
+  - id: customer_velocity
+    description: 7th+ payment by one customer within an hour
+    action: hold_for_review
+    reasons: [R01_VELOCITY]
+    when: {field: customer_txn_count_1h, op: ">=", value: 6}
+
+  - id: card_shared
+    description: one card used from 3+ devices or 4+ IPs in 24h
+    action: hold_for_review
+    reasons: [R10_CARD_SHARED]
+    when:
+      any:
+        - {field: card_distinct_devices_24h, op: ">=", value: 3}
+        - {field: card_distinct_ips_24h, op: ">=", value: 4}
+
+  - id: repeat_chargebacks
+    description: customer has disputed 3+ payments
+    action: block
+    reasons: [R05_CHARGEBACK_HISTORY]
+    when: {field: past_chargebacks, op: ">=", value: 3}
+
+  - id: chargebacks_review
+    description: customer has disputed 2 payments
+    action: hold_for_review
+    reasons: [R05_CHARGEBACK_HISTORY]
+    when: {field: past_chargebacks, op: "==", value: 2}
+
+  - id: stolen_card_cash_out
+    description: new account + high amount + middle of the night
+    action: block
+    reasons: [R04_NEW_ACCOUNT, R02_AMOUNT_ANOMALY, R07_ODD_HOUR]
+    when:
+      all:
+        - {field: account_age_days, op: "<=", value: 30}
+        - {field: amount_inr, op: ">=", value: 15000}
+        - {field: is_odd_hour, op: "==", value: 1}
+
+  - id: geo_mismatch_new_device
+    description: IP country differs from billing country, on a new device, high value
+    action: hold_for_review
+    reasons: [R06_GEO_MISMATCH, R03_NEW_DEVICE]
+    when:
+      all:
+        - {field: ip_billing_country_mismatch, op: "==", value: 1}
+        - {field: is_new_device, op: "==", value: 1}
+        - {field: amount_inr, op: ">=", value: 5000}
+
+  - id: new_card_large_amount
+    description: first payment we see on this card is large
+    action: hold_for_review
+    reasons: [R02_AMOUNT_ANOMALY]
+    when:
+      all:
+        - {field: card_is_new, op: "==", value: 1}
+        - {field: amount_inr, op: ">=", value: 50000}

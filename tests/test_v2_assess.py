@@ -5,103 +5,21 @@
 
 from __future__ import annotations
 
-import os
 import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
 import redis as redis_lib
-from fastapi.testclient import TestClient
 
 from api.main import app, get_feature_store
 from fallback_rules import VALID_ACTIONS
-from risk_v2.assembler import amount_in_inr_minor
 from risk_v2.store import FeatureStore
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HOUR = 3600
-
-
-class FakeClock:
-    def __init__(self, start: float = 1_790_000_000.0):
-        self.now = start
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
-
-
-@pytest.fixture(scope="module")
-def redis_client():
-    try:
-        from testcontainers.redis import RedisContainer
-        container = RedisContainer("redis:7.4-alpine")
-        container.start()
-    except Exception as exc:  # noqa: BLE001 - no Docker on this machine
-        pytest.skip(f"Docker/Testcontainers not available: {exc}")
-    host, port = container.get_container_host_ip(), container.get_exposed_port(6379)
-    client = redis_lib.Redis(host=host, port=int(port), decode_responses=True)
-    yield client
-    container.stop()
+from v2_support import HOUR, facts, observe
 
 
 @pytest.fixture
-def clock():
-    return FakeClock()
-
-
-@pytest.fixture
-def store(redis_client, clock):
-    redis_client.flushdb()
-    return FeatureStore(redis_client, clock=clock)
-
-
-@pytest.fixture
-def client(store, tmp_path, monkeypatch):
-    if not os.path.exists(os.path.join(ROOT, "model", "model.pkl")):
-        pytest.skip("model/model.pkl not built - run `python model/train.py`")
-    import audit
-    import reasoning_agent
-    from llm_client import LLMUnavailable
-
-    monkeypatch.setattr(audit, "DEFAULT_PATH", str(tmp_path / "audit.jsonl"))
-
-    def _no_llm(_prompt):
-        raise LLMUnavailable("disabled in tests")
-
-    monkeypatch.setattr(reasoning_agent, "call_gemini", _no_llm)
-    app.dependency_overrides[get_feature_store] = lambda: store
-    yield TestClient(app)
-    app.dependency_overrides.clear()
-
-
-_seq = iter(range(1, 10**9))
-
-
-def facts(**overrides) -> dict:
-    body = {
-        "transaction_id": f"pay-{next(_seq)}",
-        "amount_minor": 150_000,                    # INR 1,500.00
-        "currency": "INR",
-        "card_token": "tok_abcdefgh23",
-        "card_fingerprint": "fp" + "a" * 62,
-        "last4": "4242",
-        "customer_id": "cust-1",
-        "merchant_id": "M1001",
-        "ip": "203.0.113.7",
-        "device_id": "dev-1",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    body.update(overrides)
-    return body
-
-
-def observe(store, body: dict):
-    return store.observe(transaction_id=body["transaction_id"], customer_id=body["customer_id"],
-                         card_fingerprint=body["card_fingerprint"], device_id=body["device_id"], ip=body["ip"],
-                         amount_inr_minor=amount_in_inr_minor(body["amount_minor"], body["currency"]))
+def client(v2_client):
+    return v2_client
 
 
 # ---- contract ----
