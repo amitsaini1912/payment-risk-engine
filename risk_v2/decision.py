@@ -6,16 +6,17 @@
 - The model scores even when a rule already blocks: the score is recorded for later analysis (Day 17/18).
 - Model can't score (no model file / bad row) -> at least hold_for_review with R99_NOT_SCORED, never allow.
 - Every hold or block carries at least one reason code.
-- The LLM (if configured) only words the explanation (risk_v2/explain.py).
+- The LLM (if configured) only words the explanation (risk_v2/explain.py), with whatever is left of the 300 ms
+  budget (risk_v2/budget.py).
 """
 
 from __future__ import annotations
 
 from typing import Callable, Optional
 
-from audit import write_entry
 from scorer import ScoringError, load_scorer
 
+from risk_v2.budget import Deadline
 from risk_v2.contributions import score_with_contributions
 from risk_v2.explain import explain
 from risk_v2.rules import RuleBook, build_context
@@ -28,7 +29,7 @@ def _strictest(*actions: str) -> str:
 
 
 def decide(facts, signals, model_input: dict, book: RuleBook,
-           llm_fn: Optional[Callable[[str], str]] = None) -> dict:
+           llm_fn: Optional[Callable[[str], str]] = None, deadline: Optional[Deadline] = None) -> dict:
     fired = book.evaluate(build_context(facts, signals, model_input))
     reasons = [{"code": code, "source": "rule", "rule": f.id, "detail": f.detail}
                for f in fired for code in f.reasons]
@@ -61,8 +62,9 @@ def decide(facts, signals, model_input: dict, book: RuleBook,
 
     codes = list(dict.fromkeys(r["code"] for r in reasons))
     try:
-        explanation, explanation_source, llm_failure = explain(action, reasons, model_score, review_at, block_at,
-                                                               llm_fn=llm_fn)
+        explanation, explanation_source, llm_failure = explain(
+            action, reasons, model_score, review_at, block_at, llm_fn=llm_fn,
+            time_left_s=deadline.left_for_optional_work() if deadline else None)
     except Exception:  # noqa: BLE001 - the decision is made; wording it must never turn it into a 500
         explanation, explanation_source, llm_failure = f"{action.upper()}: {', '.join(codes)}", "codes", \
             "explanation_error"
@@ -84,7 +86,8 @@ def decide(facts, signals, model_input: dict, book: RuleBook,
         "confidence": _confidence(model_score, review_at, block_at, bool(fired)),
         "feature_snapshot": features,
     }
-    write_entry({**result, "api_version": "v2"})
+    if deadline:
+        result["decided_in_ms"] = round(deadline.elapsed_s() * 1000, 1)
     return result
 
 

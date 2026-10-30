@@ -190,3 +190,28 @@ def test_a_typo_reports_one_error_at_its_place():
     with pytest.raises(RulesInvalid) as err:
         parse(ONE_RULE.replace(b"value: 3", b"value: three"))
     assert str(err.value).startswith("1 validation error") and "rules.0.when" in str(err.value)
+
+
+def test_requests_during_the_first_load_wait_for_it(tmp_path, monkeypatch):
+    """Day 16 race: the file was marked 'seen' before parsing finished, so a concurrent request got 'no rules'."""
+    import threading
+    import time as _time
+
+    import risk_v2.rules as rules_mod
+    path = tmp_path / "rules.yaml"
+    write(path, ONE_RULE)
+    real_parse = rules_mod.parse
+    monkeypatch.setattr(rules_mod, "parse", lambda raw: _time.sleep(0.2) or real_parse(raw))   # a slow first load
+    loader, results = RuleLoader(str(path)), []
+
+    def get():
+        try:
+            results.append(loader.get().version)
+        except RulesUnavailable as exc:
+            results.append(exc)
+    threads = [threading.Thread(target=get) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(set(results)) == 1 and isinstance(results[0], str)

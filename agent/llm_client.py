@@ -29,6 +29,10 @@ FALLBACK_MODELS = [
 ]
 
 
+# The HTTP call's own timeout, so a hung request ends and frees its llm_pool worker (#18). Per model tried.
+HTTP_TIMEOUT_MS = int(os.environ.get("LLM_HTTP_TIMEOUT_MS", "10000"))
+
+
 class LLMUnavailable(RuntimeError):
     """No API key configured, or the SDK is not installed."""
 
@@ -58,7 +62,7 @@ def call_gemini(prompt: str, model: str = DEFAULT_MODEL,
     except ImportError as exc:  # pragma: no cover
         raise LLMUnavailable(f"google-genai not installed: {exc}") from exc
 
-    client = genai.Client(api_key=key)
+    client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=HTTP_TIMEOUT_MS))
     config = types.GenerateContentConfig(
         temperature=temperature,
         max_output_tokens=max_output_tokens,

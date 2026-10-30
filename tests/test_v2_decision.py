@@ -130,9 +130,8 @@ def test_a_retry_gets_the_same_decision(v2_client):
     body = facts(timestamp=AFTERNOON_IST, amount_minor=50_000)
     first = v2_client.post("/v2/assess", json=body).json()
     again = v2_client.post("/v2/assess", json=body).json()
-    assert again["signals"]["replayed"] is True
-    for key in ("action", "reason_codes", "rules_fired", "model_score"):
-        assert again[key] == first[key]
+    assert first["replayed"] is False and again["replayed"] is True
+    assert {k: v for k, v in again.items() if k != "replayed"} == {k: v for k, v in first.items() if k != "replayed"}
 
 
 def test_decision_is_in_the_audit_trail_with_its_reasons(v2_client):
@@ -188,7 +187,14 @@ def test_model_unavailable_holds_with_r99_never_allows(v2_client, monkeypatch):
     assert body["reason_codes"] == ["R99_NOT_SCORED"]
 
 
-def test_the_llm_words_the_explanation_but_cannot_change_the_action(v2_client, explainer):
+@pytest.fixture
+def time_for_the_llm(monkeypatch):
+    """These tests are about what the LLM may change, not about the 300 ms budget (Day 16): give it time."""
+    import risk_v2.budget as budget
+    monkeypatch.setattr(budget, "BUDGET_S", 5.0)
+
+
+def test_the_llm_words_the_explanation_but_cannot_change_the_action(v2_client, explainer, time_for_the_llm):
     prompts = []
 
     def persuasive_llm(prompt):
@@ -204,7 +210,7 @@ def test_the_llm_words_the_explanation_but_cannot_change_the_action(v2_client, e
 
 @pytest.mark.parametrize("reply, failure", [("no json here", "llm_malformed"), ('{"explanation": ""}', "llm_malformed"),
                                             (None, "llm_malformed")])
-def test_a_bad_llm_answer_falls_back_to_the_template(v2_client, explainer, reply, failure):
+def test_a_bad_llm_answer_falls_back_to_the_template(v2_client, explainer, reply, failure, time_for_the_llm):
     explainer["fn"] = lambda _prompt: reply
     body = assess(v2_client, amount_minor=4_500_000, timestamp=NIGHT_IST)
     assert body["action"] == "block" and body["explanation_source"] == "template"

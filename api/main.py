@@ -7,7 +7,11 @@ FastAPI service exposing the risk agent.
   GET  /audit/{txn_id}      retrieve the logged decision for a transaction
   GET  /audit               recent decisions (dashboard convenience)
   GET  /metrics             Day-2 model metrics
+  GET  /metrics/prometheus  service metrics for Prometheus (latency histogram, decisions, 503s, ...)
   GET  /health              liveness
+  GET  /ready               readiness: API keys, rules, model and Redis all usable
+
+/assess, /v2/assess and /audit need `X-API-Key` (RISK_API_KEYS, risk_v2/auth.py).
 
 Run:
   uvicorn api.main:app --reload --port 8000     # from the repo root
@@ -15,12 +19,17 @@ Run:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
 import uuid
+from contextlib import asynccontextmanager
+from functools import lru_cache
 from typing import Callable, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field, field_validator
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -28,21 +37,69 @@ sys.path.insert(0, _ROOT)  # the risk_v2 package
 for sub in ("agent", "model"):
     sys.path.insert(0, os.path.join(_ROOT, sub))
 
-from audit import get_by_transaction_id, recent  # noqa: E402
+import llm_pool  # noqa: E402
+from audit import get_by_transaction_id, recent, write_entry  # noqa: E402
 from failure_sim import SIMULATIONS  # noqa: E402
 from llm_client import DEFAULT_MODEL, is_configured  # noqa: E402
 from reasoning_agent import assess  # noqa: E402
+from risk_v2 import metrics as m  # noqa: E402
 from risk_v2.assembler import UnsupportedCurrency, amount_in_inr_minor, to_model_transaction  # noqa: E402
+from risk_v2.auth import ApiKeys, AuthNotConfigured  # noqa: E402
+from risk_v2.budget import Deadline  # noqa: E402
 from risk_v2.contract import AssessV2Request  # noqa: E402
 from risk_v2.decision import decide  # noqa: E402
+from risk_v2.decisions import DecisionConflict, DecisionStore, request_hash  # noqa: E402
 from risk_v2.rules import RuleBook, RuleLoader, RulesUnavailable  # noqa: E402
 from risk_v2.store import FeatureStore, FeaturesUnavailable  # noqa: E402
+from scorer import load_scorer  # noqa: E402
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Load the model and rules before the first request: the first payment must not pay ~1 s of joblib load."""
+    for warm in (load_scorer, get_rule_loader().get):
+        try:
+            warm()
+        except Exception as exc:  # noqa: BLE001 - /ready reports it; the process still starts
+            print(f"[startup] warm-up {getattr(warm, '__name__', warm)} failed: {exc}")
+    yield
+
 
 app = FastAPI(
     title="Razorpay Risk Agent",
     version="1.0.0",
     description="Chargeback-risk scoring + LLM reasoning agent with deterministic fallback.",
+    lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def _timing(request: Request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    route = request.scope.get("route")
+    m.REQUEST_SECONDS.labels(getattr(route, "path", "unmatched"), str(response.status_code)).observe(
+        time.perf_counter() - started)
+    return response
+
+
+@lru_cache(maxsize=1)
+def get_api_keys() -> ApiKeys:
+    """RISK_API_KEYS, read once. Tests override this."""
+    return ApiKeys()
+
+
+def require_caller(x_api_key: Optional[str] = Header(default=None),
+                   keys: ApiKeys = Depends(get_api_keys)) -> str:
+    try:
+        caller = keys.caller(x_api_key)
+    except AuthNotConfigured as exc:
+        raise HTTPException(status_code=503, detail="risk engine auth not configured") from exc
+    if caller is None:
+        m.AUTH_FAILURES.inc()
+        raise HTTPException(status_code=401, detail="missing or invalid X-API-Key",
+                            headers={"WWW-Authenticate": "ApiKey"})
+    return caller
 
 PAYMENT_METHODS = {"card", "upi", "netbanking", "wallet", "emi"}
 CARD_TYPES = {"credit", "debit", "prepaid", "na"}
@@ -122,9 +179,14 @@ def health(loader: RuleLoader = Depends(get_rule_loader)) -> dict:
     }
 
 
+@app.get("/metrics/prometheus")
+def prometheus_metrics() -> Response:
+    m.LLM_IN_FLIGHT.set(llm_pool.in_flight())
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.get("/metrics")
 def metrics() -> dict:
-    import json
     path = os.path.join(_ROOT, "model", "metrics.json")
     if not os.path.exists(path):
         raise HTTPException(status_code=503, detail="model not trained yet")
@@ -133,7 +195,8 @@ def metrics() -> dict:
 
 
 @app.post("/assess", response_model=Verdict)
-def assess_transaction(txn: TransactionIn, simulate: Optional[str] = None) -> dict:
+def assess_transaction(txn: TransactionIn, simulate: Optional[str] = None,
+                       _caller: str = Depends(require_caller)) -> dict:
     """Assess a transaction.
 
     `?simulate=llm_timeout|llm_unreachable|llm_malformed|bad_input` forces that
@@ -149,8 +212,11 @@ def assess_transaction(txn: TransactionIn, simulate: Optional[str] = None) -> di
                     status_code=400,
                     detail=f"unknown simulate mode; choose from {sorted(SIMULATIONS)}",
                 )
-            return SIMULATIONS[simulate](payload)
-        return assess(payload)
+            verdict = SIMULATIONS[simulate](payload)
+        else:
+            verdict = assess(payload)
+        m.DECISIONS.labels("v1", verdict["action"], verdict["path_used"]).inc()
+        return verdict
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 - assess() shouldn't raise, but never 500 silently
@@ -160,6 +226,8 @@ def assess_transaction(txn: TransactionIn, simulate: Optional[str] = None) -> di
 class VerdictV2(BaseModel):
     api_version: str
     transaction_id: str
+    replayed: bool                   # true = the stored decision for this transaction_id (Day 16), nothing recomputed
+    decided_in_ms: float             # time to the decision on the first request (budget: RISK_BUDGET_MS, 300)
     action: str                      # allow | hold_for_review | block - decided by rules + model, never the LLM
     reason_codes: list[str]          # fixed codes (risk_v2/reason_codes.py), most decisive first
     reasons: list[dict]              # each code with its source (rule / model / engine) and evidence
@@ -190,6 +258,10 @@ def get_feature_store() -> FeatureStore:
     return _feature_store
 
 
+def get_decision_store(store: FeatureStore = Depends(get_feature_store)) -> DecisionStore:
+    return DecisionStore(store.client)
+
+
 def get_explainer() -> Optional[Callable[[str], str]]:
     """The LLM call for explanations; None = Gemini if a key is set, else the template. Tests override this."""
     return None
@@ -199,19 +271,40 @@ def get_rulebook(loader: RuleLoader = Depends(get_rule_loader)) -> RuleBook:
     try:
         return loader.get()
     except RulesUnavailable as exc:
+        m.UNAVAILABLE.labels("rules").inc()
         raise HTTPException(status_code=503, detail="risk rules unavailable, use fallback") from exc
 
 
+def _features_unavailable(exc: Exception) -> HTTPException:
+    m.UNAVAILABLE.labels("features").inc()
+    return HTTPException(status_code=503, detail="risk features unavailable, use fallback")
+
+
 @app.post("/v2/assess", response_model=VerdictV2)
-def assess_v2(req: AssessV2Request, store: FeatureStore = Depends(get_feature_store),
+def assess_v2(req: AssessV2Request, caller: str = Depends(require_caller),
+              store: FeatureStore = Depends(get_feature_store),
+              decisions: DecisionStore = Depends(get_decision_store),
               book: RuleBook = Depends(get_rulebook),
               explainer: Optional[Callable[[str], str]] = Depends(get_explainer)) -> dict:
     """Billing sends facts; every risk feature is computed here (weakness #14). Old /assess is unchanged.
 
     Pipeline (docs/adr/0002): rules.yaml -> model + per-reason contributions -> strictest action -> explanation.
-    422: invalid facts or an unsupported currency. 503: the feature store (Redis) or the rules are unavailable -
-    we never score with made-up "0 earlier payments" velocity; the caller uses its own fallback.
+    Same transaction_id again -> the stored decision (docs/adr/0003); with different facts -> 409.
+    401: no/wrong X-API-Key. 422: invalid facts or an unsupported currency. 503: Redis or the rules are
+    unavailable - we never score with made-up "0 earlier payments" velocity; the caller uses its own fallback.
     """
+    deadline = Deadline()
+    req_hash = request_hash(req)
+    try:
+        stored = decisions.get(req.transaction_id, req_hash)
+    except DecisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except FeaturesUnavailable as exc:
+        raise _features_unavailable(exc) from exc
+    if stored is not None:
+        m.REPLAYS.inc()
+        return {**stored, "replayed": True}
+
     try:
         inr_minor = amount_in_inr_minor(req.amount_minor, req.currency)
     except UnsupportedCurrency as exc:
@@ -221,14 +314,34 @@ def assess_v2(req: AssessV2Request, store: FeatureStore = Depends(get_feature_st
                                 card_fingerprint=req.card_fingerprint, device_id=req.device_id,
                                 ip=str(req.ip), amount_inr_minor=inr_minor)
     except FeaturesUnavailable as exc:
-        raise HTTPException(status_code=503, detail="risk features unavailable, use fallback") from exc
+        raise _features_unavailable(exc) from exc
     model_input = to_model_transaction(req, signals, inr_minor)
-    verdict = decide(req, signals, model_input, book, llm_fn=explainer)
-    return {**verdict, "api_version": "v2", "signals": signals.as_dict(), "model_input": model_input}
+    verdict = decide(req, signals, model_input, book, llm_fn=explainer, deadline=deadline)
+    decision = {**verdict, "api_version": "v2", "replayed": False, "signals": signals.as_dict(),
+                "model_input": model_input}
+    try:
+        kept = decisions.put_first(req.transaction_id, req_hash, decision)
+    except DecisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except FeaturesUnavailable as exc:  # decided but can't store it: a retry might differ -> let billing fall back
+        raise _features_unavailable(exc) from exc
+    if kept is not decision:            # a concurrent copy of this request stored first: answer with that one
+        m.REPLAYS.inc()
+        return {**kept, "replayed": True}
+
+    write_entry({**decision, "caller": caller})
+    m.DECISIONS.labels("v2", decision["action"], decision["path_used"]).inc()
+    m.EXPLANATIONS.labels(decision["explanation_source"], decision["failure_mode"] or "none").inc()
+    if decision["action"] != "allow":
+        for code in decision["reason_codes"]:
+            m.REASON_CODES.labels(code).inc()
+    if decision["decided_in_ms"] > deadline.budget_s * 1000:
+        m.BUDGET_EXCEEDED.inc()
+    return decision
 
 
 @app.get("/audit/{transaction_id}")
-def get_audit(transaction_id: str) -> dict:
+def get_audit(transaction_id: str, _caller: str = Depends(require_caller)) -> dict:
     entry = get_by_transaction_id(transaction_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"no audit entry for {transaction_id}")
@@ -236,5 +349,25 @@ def get_audit(transaction_id: str) -> dict:
 
 
 @app.get("/audit")
-def list_audit(limit: int = 25) -> dict:
-    return {"count": limit, "entries": recent(limit)}
+def list_audit(limit: int = 25, _caller: str = Depends(require_caller)) -> dict:
+    entries = recent(limit)
+    return {"count": len(entries), "entries": entries}   # was `"count": limit` (weakness #20)
+
+
+@app.get("/ready")
+def ready(loader: RuleLoader = Depends(get_rule_loader), keys: ApiKeys = Depends(get_api_keys),
+          store: FeatureStore = Depends(get_feature_store)) -> Response:
+    """Readiness (k8s/compose): 200 only when a /v2 decision can actually be made, else 503 with what is wrong."""
+    checks = {}
+    for name, check in (("api_keys", lambda: keys.caller("") is None),
+                        ("rules", lambda: loader.get().version),
+                        ("model", lambda: load_scorer().threshold),
+                        ("redis", lambda: store.client.ping())):
+        try:
+            check()
+            checks[name] = "ok"
+        except Exception as exc:  # noqa: BLE001
+            checks[name] = f"{type(exc).__name__}: {exc}"[:200]
+    ok = all(v == "ok" for v in checks.values())
+    return Response(content=json.dumps({"ready": ok, "checks": checks}),
+                    status_code=200 if ok else 503, media_type="application/json")

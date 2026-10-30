@@ -60,6 +60,10 @@ class FeatureStore:
         with open(_LUA) as fh:
             self._script = client.register_script(fh.read())
 
+    @property
+    def client(self) -> redis.Redis:
+        return self._client
+
     @classmethod
     def from_url(cls, url: str) -> "FeatureStore":
         return cls(redis.Redis.from_url(url, socket_timeout=REDIS_TIMEOUT_S,

@@ -1,33 +1,15 @@
-# Python 3.9+ . Tested on 3.9.6 (macOS).
+# Python 3.9+ . Tested on 3.9.6 (macOS) and 3.12 (Linux, Portfolio Days 14+).
 # Install:  python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
 
-# --- data + model (Day 1-2) ---
-# Gradient-boosted trees come from scikit-learn's HistGradientBoostingClassifier,
-# not xgboost, so there is no native OpenMP/libomp dependency to install.
-pandas==2.3.3
-numpy==2.0.2
-scikit-learn==1.6.1
-scipy==1.13.1
+# The API's own runtime dependencies (also what the Docker image installs):
+-r requirements-runtime.txt
+
+# --- training plot (model/threshold_analysis.py) ---
 matplotlib==3.9.4
-joblib==1.5.3
 
-# --- reasoning agent (Day 3) ---
-# LLM = Google Gemini (free tier). The agent is key-optional: with no
-# GEMINI_API_KEY it uses the deterministic fallback.
-google-genai==1.47.0
-python-dotenv==1.2.1
-
-# --- API + dashboard (Day 4) ---
-fastapi==0.128.8
-uvicorn==0.39.0
+# --- dashboard (Day 4) ---
 streamlit==1.50.0
 requests==2.32.5
-
-# --- /v2/assess feature store (Portfolio Day 14): velocity + profiles in Redis ---
-redis==5.2.1
-
-# --- /v2 rules engine (Portfolio Day 15): rules.yaml, loaded with yaml.safe_load only ---
-PyYAML==6.0.2
 
 # --- tests (Day 5) ---
 pytest==8.4.2

@@ -1,0 +1,22 @@
+# What the risk API needs to RUN (the Docker image installs only this). requirements.txt adds the dashboard,
+# the training plot and the tests on top.
+
+# --- model ---
+pandas==2.3.3
+numpy==2.0.2
+scikit-learn==1.6.1
+scipy==1.13.1
+joblib==1.5.3
+
+# --- reasoning agent: Gemini is optional (no key -> deterministic fallback / template explanations) ---
+google-genai==1.47.0
+python-dotenv==1.2.1
+
+# --- API ---
+fastapi==0.128.8
+uvicorn==0.39.0
+prometheus-client==0.21.1      # GET /metrics/prometheus (Portfolio Day 16)
+
+# --- /v2: feature store (Day 14) + rules engine (Day 15, yaml.safe_load only) ---
+redis==5.2.1
+PyYAML==6.0.2

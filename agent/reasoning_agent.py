@@ -6,7 +6,8 @@ Given a raw transaction, it:
   2. Asks an LLM (Gemini flash-lite) for a STRUCTURED verdict - action +
      explanation + confidence - passing the score and the derived risk features
      as context. The LLM *decides*; it is not a chatbot.
-  3. Enforces a hard ~35s wall-clock timeout on that call.
+  3. Enforces a hard ~35s wall-clock timeout on that call, on a bounded worker
+     pool (llm_pool.py): no orphan thread per timed-out call (#18).
   4. Validates the LLM's JSON against a strict schema.
   5. On ANY failure (timeout, unreachable, malformed output, un-scorable input)
      falls back to the deterministic rule engine.
@@ -23,7 +24,6 @@ import json
 import os
 import re
 import sys
-import threading
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "model"))
@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audit import write_entry  # noqa: E402
 from fallback_rules import VALID_ACTIONS, decide as fallback_decide  # noqa: E402
 from llm_client import LLMError, LLMUnavailable, call_gemini  # noqa: E402
+from llm_pool import LLMBusy, LLMTimeout, run as run_llm  # noqa: E402
 from scorer import ScoringError, load_scorer  # noqa: E402
 
 DEFAULT_TIMEOUT_S = 35.0
@@ -99,35 +100,6 @@ def _validate_verdict(obj: dict) -> dict:
             "confidence": round(confidence, 3)}
 
 
-class LLMTimeout(RuntimeError):
-    """The LLM call did not return within the wall-clock budget."""
-
-
-def _run_with_timeout(fn, arg, timeout_s: float):
-    """Run fn(arg) with a hard wall-clock timeout.
-
-    Uses a daemon thread and does NOT join it back if it overruns - so a hung
-    LLM call cannot block the decision path. The orphaned thread dies with the
-    process; a real Gemini timeout surfaces as a network error well before this.
-    """
-    box: dict = {}
-
-    def target():
-        try:
-            box["result"] = fn(arg)
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller thread
-            box["error"] = exc
-
-    worker = threading.Thread(target=target, daemon=True)
-    worker.start()
-    worker.join(timeout_s)
-    if worker.is_alive():
-        raise LLMTimeout(f"no response within {timeout_s:.1f}s")
-    if "error" in box:
-        raise box["error"]
-    return box.get("result")
-
-
 def assess(transaction: dict, *, llm_fn=None, timeout_s: float = DEFAULT_TIMEOUT_S,
            audit_path: str | None = None) -> dict:
     """Assess one transaction. Always returns a verdict dict; never raises."""
@@ -158,9 +130,12 @@ def assess(transaction: dict, *, llm_fn=None, timeout_s: float = DEFAULT_TIMEOUT
     prompt = _build_prompt(txn_id, model_score, threshold, features)
     error_detail = None
     try:
-        llm_raw = _run_with_timeout(llm_fn, prompt, timeout_s)
+        llm_raw = run_llm(llm_fn, prompt, timeout_s)
     except LLMTimeout as exc:
         failure_mode = "llm_timeout"
+        error_detail = str(exc)
+    except LLMBusy as exc:
+        failure_mode = "llm_busy"
         error_detail = str(exc)
     except LLMUnavailable as exc:
         failure_mode = "llm_unavailable"
@@ -201,7 +176,7 @@ def _finalize(txn_id, model_score, threshold, path_used, failure_mode,
         "model_score": round(model_score, 4) if model_score is not None else None,
         "threshold": threshold,
         "path_used": path_used,               # "llm" | "fallback"
-        "failure_mode": failure_mode,         # None | llm_timeout | llm_unavailable
+        "failure_mode": failure_mode,         # None | llm_timeout | llm_busy | llm_unavailable
                                               # | llm_error | llm_malformed | bad_input
         "action": verdict["action"],
         "explanation": verdict["explanation"],

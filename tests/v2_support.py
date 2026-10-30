@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from risk_v2.assembler import amount_in_inr_minor
 
 HOUR = 3600
+API_KEY = "test-billing-key-0123456789"
+API_KEYS = f"billing:{API_KEY},dashboard:test-dashboard-key-0123"
+AUTH = {"X-API-Key": API_KEY}
 
 
 class FakeClock:

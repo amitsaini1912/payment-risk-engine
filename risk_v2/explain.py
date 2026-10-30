@@ -2,7 +2,9 @@
 Explanation for a /v2 decision that is ALREADY made (rules + model). The LLM only writes the sentence; it cannot
 change the action, and any LLM failure falls back to a template built from the reason codes (docs/adr/0002).
 
-Timeout: LLM_EXPLAIN_TIMEOUT_S (default 5 s) for now; Day 16 puts it inside the 300 ms budget, off the hot path.
+Time: the LLM gets only what is left of the request's 300 ms budget (Day 16), at most LLM_EXPLAIN_TIMEOUT_S, and runs
+on the bounded llm_pool (no orphan threads). Less than MIN_LLM_S left -> not even tried ("llm_no_budget").
+In practice a ~1 s Gemini call rarely fits: the template is the normal explanation on /v2.
 """
 
 from __future__ import annotations
@@ -12,11 +14,13 @@ import os
 from typing import Callable, Optional
 
 from llm_client import LLMError, LLMUnavailable, call_gemini, is_configured
-from reasoning_agent import LLMTimeout, _extract_json, _run_with_timeout
+from llm_pool import LLMBusy, LLMTimeout, run as run_llm
+from reasoning_agent import _extract_json
 
 from risk_v2.reason_codes import REASON_CODES
 
 EXPLAIN_TIMEOUT_S = float(os.environ.get("LLM_EXPLAIN_TIMEOUT_S", "5"))
+MIN_LLM_S = 0.05
 MAX_EXPLANATION_CHARS = 400
 
 _PROMPT = """You explain payment-risk decisions to a fraud analyst. The decision below is FINAL - do not \
@@ -47,22 +51,28 @@ def template(action: str, reasons: list[dict], model_score: Optional[float]) -> 
 
 
 def explain(action: str, reasons: list[dict], model_score: Optional[float], review_at: Optional[float],
-            block_at: float, llm_fn: Optional[Callable[[str], str]] = None) -> tuple[str, str, Optional[str]]:
+            block_at: float, llm_fn: Optional[Callable[[str], str]] = None,
+            time_left_s: Optional[float] = None) -> tuple[str, str, Optional[str]]:
     """Return (explanation, source "llm"|"template", failure_mode or None)."""
     fallback = template(action, reasons, model_score)
     if llm_fn is None:
         if not is_configured():
             return fallback, "template", None   # no key: not a failure, just no LLM
         llm_fn = call_gemini
+    timeout_s = EXPLAIN_TIMEOUT_S if time_left_s is None else min(EXPLAIN_TIMEOUT_S, time_left_s)
+    if timeout_s < MIN_LLM_S:
+        return fallback, "template", "llm_no_budget"
     lines = "\n".join(f"- {r['code']} ({r['source']}): {r.get('detail') or REASON_CODES[r['code']]}"
                       for r in reasons) or "- none"
     prompt = _PROMPT.format(action=action, score=model_score, review_at=review_at, block_at=block_at,
                             reasons=lines)
     try:
-        raw = _run_with_timeout(llm_fn, prompt, EXPLAIN_TIMEOUT_S)
+        raw = run_llm(llm_fn, prompt, timeout_s)
         text = _extract_json(raw or "").get("explanation")
     except LLMTimeout:
         return fallback, "template", "llm_timeout"
+    except LLMBusy:
+        return fallback, "template", "llm_busy"
     except LLMUnavailable:
         return fallback, "template", "llm_unavailable"
     except (LLMError, ValueError, json.JSONDecodeError, AttributeError):

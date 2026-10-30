@@ -1,0 +1,15 @@
+# keep the build context small and secret-free
+.git
+.env
+venv/
+.venv/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+logs/
+data/transactions.csv
+model/model.pkl
+tests/
+dashboard/
+learning_notes/
+docs/

@@ -30,7 +30,11 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for sub in ("agent", "model"):
     sys.path.insert(0, os.path.join(_ROOT, sub))
 
+import llm_client  # noqa: E402,F401 - loads .env (RISK_API_KEY) like the API does
+
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
+# /assess and /audit need a key since Day 16: one of the RISK_API_KEYS (the "dashboard:" one)
+HEADERS = {"X-API-Key": os.environ.get("RISK_API_KEY", "")}
 
 st.set_page_config(page_title="Razorpay Risk Agent", page_icon="🛡️", layout="wide")
 
@@ -60,7 +64,8 @@ def call_assess(payload: dict, simulate: str | None = None) -> dict:
     health = _api_alive()
     if health is not None:
         params = {"simulate": simulate} if simulate else None
-        r = requests.post(f"{API_URL}/assess", json=payload, params=params, timeout=45)
+        r = requests.post(f"{API_URL}/assess", json=payload, params=params, headers=HEADERS,
+                          timeout=45)
         r.raise_for_status()
         return r.json()
     assess, sims = _in_process()
@@ -74,7 +79,7 @@ def load_audit(limit: int = 30) -> list[dict]:
     if health is not None:
         try:
             return requests.get(f"{API_URL}/audit", params={"limit": limit},
-                                timeout=3).json().get("entries", [])
+                                headers=HEADERS, timeout=3).json().get("entries", [])
         except requests.RequestException:
             pass
     from audit import recent

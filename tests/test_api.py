@@ -37,7 +37,8 @@ def client(tmp_path, monkeypatch):
         raise LLMUnavailable("disabled in tests")
 
     monkeypatch.setattr(reasoning_agent, "call_gemini", _no_llm)
-    return TestClient(app)
+    from v2_support import AUTH
+    return TestClient(app, headers=AUTH)
 
 
 def _body(**over):

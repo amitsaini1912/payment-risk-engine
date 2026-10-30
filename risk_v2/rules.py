@@ -239,17 +239,20 @@ class RuleLoader:
         return self._book
 
     def _reload(self, key: tuple) -> None:
-        self._seen = key
+        # _seen is set only AFTER the attempt: other threads compare it without the lock, and setting it first let
+        # a request during the very first load skip the lock, find no rules yet and answer 503 (Day 16 race)
         try:
             with open(self.path, "rb") as fh:
                 book = parse(fh.read())
         except (OSError, RulesInvalid) as exc:
             self._remember_error(str(exc))
+            self._seen = key
             return
         if self._book is None or book.version != self._book.version:
             log.info("rules %s loaded from %s (%d rules)", book.version, self.path, len(book.rules))
         self._book = book
         self.last_error = None
+        self._seen = key
 
     def _remember_error(self, error: str) -> None:
         if error != self.last_error:

@@ -15,6 +15,17 @@ for sub in ("agent", "model", "api"):
     sys.path.insert(0, os.path.join(ROOT, sub))
 
 
+@pytest.fixture(autouse=True)
+def api_keys():
+    """Every test runs with known API keys (v2_support.API_KEYS) instead of the environment's."""
+    from api.main import app, get_api_keys
+    from risk_v2.auth import ApiKeys
+    from v2_support import API_KEYS
+    app.dependency_overrides[get_api_keys] = lambda: ApiKeys(API_KEYS)
+    yield
+    app.dependency_overrides.pop(get_api_keys, None)
+
+
 @pytest.fixture
 def sample_transaction() -> dict:
     """A mid-risk, fully-populated transaction."""
@@ -133,5 +144,7 @@ def v2_client(store, rules_path, explainer, tmp_path, monkeypatch):
     app.dependency_overrides[get_feature_store] = lambda: store
     app.dependency_overrides[get_rule_loader] = lambda: loader
     app.dependency_overrides[get_explainer] = lambda: explainer["fn"]
-    yield TestClient(app)
-    app.dependency_overrides.clear()
+    from v2_support import AUTH
+    yield TestClient(app, headers=AUTH)
+    for dep in (get_feature_store, get_rule_loader, get_explainer):
+        app.dependency_overrides.pop(dep, None)
