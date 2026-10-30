@@ -1,54 +1,71 @@
 {
   "dataset": {
     "rows": 15000,
-    "chargeback_rate": 0.0663,
+    "chargeback_rate": 0.0553,
+    "split": {
+      "train": 9000,
+      "validation": 3000,
+      "test": 3000
+    },
     "test_rows": 3000,
-    "test_chargebacks": 199
+    "test_chargebacks": 166,
+    "data_sha256": "1d78194b7759369ebb416a0fa126a80a1bf3a97332d71619278ea394705f9ba8"
   },
-  "candidates_at_threshold_0.5": {
+  "selection": "lowest validation cost at the validation-tuned threshold (precision floor), tie-break AP",
+  "candidates_validation": {
     "logistic_regression": {
-      "avg_precision": 0.4277,
-      "roc_auc": 0.9115,
-      "precision@0.5": 0.2721,
-      "recall@0.5": 0.8191,
-      "f1@0.5": 0.4085
+      "avg_precision": 0.4318,
+      "roc_auc": 0.9182,
+      "precision@0.5": 0.2731,
+      "recall@0.5": 0.8373,
+      "f1@0.5": 0.4119,
+      "validation_cost_at_threshold_inr": 317645.23
     },
     "random_forest": {
-      "avg_precision": 0.3879,
-      "roc_auc": 0.9192,
-      "precision@0.5": 0.3458,
-      "recall@0.5": 0.7437,
-      "f1@0.5": 0.4721
+      "avg_precision": 0.3921,
+      "roc_auc": 0.9198,
+      "precision@0.5": 0.3238,
+      "recall@0.5": 0.747,
+      "f1@0.5": 0.4517,
+      "validation_cost_at_threshold_inr": 265274.39
     },
     "hist_gradient_boosting": {
-      "avg_precision": 0.4568,
-      "roc_auc": 0.9211,
-      "precision@0.5": 0.3296,
-      "recall@0.5": 0.8844,
-      "f1@0.5": 0.4802
+      "avg_precision": 0.4213,
+      "roc_auc": 0.9127,
+      "precision@0.5": 0.3897,
+      "recall@0.5": 0.6386,
+      "f1@0.5": 0.484,
+      "validation_cost_at_threshold_inr": 357878.86
     }
   },
-  "selected_model": "hist_gradient_boosting",
+  "selected_model": "random_forest",
+  "model_version": "rf-b677801468",
+  "trained_at": "2026-10-30T19:56:47+00:00",
   "selected": {
-    "threshold": 0.4237,
-    "threshold_rationale": "cost-minimising threshold on the held-out test set, subject to a precision floor of 0.3 (manual-review capacity constraint). See threshold_analysis.py.",
+    "threshold": 0.404,
+    "threshold_rationale": "cost-minimising threshold on the VALIDATION set, subject to a precision floor of 0.3 (manual-review capacity constraint); precision/recall/cost below are on the untouched TEST set. See threshold_analysis.py.",
     "threshold_unconstrained": {
-      "threshold": 0.271,
-      "precision": 0.2821,
-      "recall": 0.9497,
-      "total_cost_inr": 245073.7
+      "threshold": 0.3449,
+      "precision_val": 0.2863,
+      "recall_val": 0.8916,
+      "total_cost_val_inr": 245502.13
     },
     "precision_floor": 0.3,
-    "precision": 0.3129,
-    "recall": 0.9246,
-    "f1": 0.4676,
-    "avg_precision": 0.4568,
-    "roc_auc": 0.9211,
+    "precision": 0.2941,
+    "recall": 0.8133,
+    "f1": 0.432,
+    "avg_precision": 0.4067,
+    "roc_auc": 0.9135,
     "confusion_matrix": {
-      "tn": 2397,
-      "fp": 404,
-      "fn": 15,
-      "tp": 184
+      "tn": 2510,
+      "fp": 324,
+      "fn": 31,
+      "tp": 135
+    },
+    "validation": {
+      "precision": 0.3089,
+      "recall": 0.8614,
+      "total_cost_inr": 265274.39
     },
     "cost": {
       "assumptions_inr": {
@@ -57,24 +74,43 @@
         "fn_amount": "actual transaction amount",
         "fp_review_cost": 400.0
       },
-      "total_cost_at_threshold_inr": 264908.95,
-      "cost_per_txn_inr": 88.3,
-      "baseline_cost_approve_all_inr": 2807214.5,
-      "baseline_cost_review_all_inr": 1120400.0
+      "total_cost_at_threshold_inr": 305314.01,
+      "cost_per_txn_inr": 101.77,
+      "baseline_cost_approve_all_inr": 2137645.46,
+      "baseline_cost_review_all_inr": 1133600.0
+    }
+  },
+  "shadow": {
+    "model_name": "logistic_regression",
+    "model_version": "lr-2dc4403f6c",
+    "threshold": 0.6699,
+    "test": {
+      "precision": 0.338,
+      "recall": 0.7229,
+      "f1": 0.4607,
+      "avg_precision": 0.4682,
+      "roc_auc": 0.914,
+      "confusion_matrix": {
+        "tn": 2599,
+        "fp": 235,
+        "fn": 46,
+        "tp": 120
+      },
+      "total_cost_inr": 380197.29
     }
   },
   "top_feature_importances": {
-    "amount": 0.1362,
-    "historical_chargeback_rate": 0.1308,
-    "amount_to_avg_ratio": 0.1055,
-    "txn_count_1h": 0.0853,
-    "past_chargebacks": 0.0403,
-    "ip_billing_country_mismatch": 0.0346,
-    "card_type": 0.0177,
-    "is_new_device": 0.0107,
-    "is_international_card": 0.0077,
-    "hour": 0.0068,
-    "account_age_days": 0.0065,
-    "email_is_disposable": 0.0024
+    "historical_chargeback_rate": 0.0661,
+    "amount_to_avg_ratio": 0.0648,
+    "past_chargebacks": 0.0554,
+    "ip_billing_country_mismatch": 0.0389,
+    "card_type": 0.029,
+    "log_amount": 0.0271,
+    "amount": 0.0215,
+    "merchant_category": 0.0199,
+    "log_account_age": 0.0197,
+    "hour": 0.0177,
+    "account_age_days": 0.0129,
+    "is_high_amount": 0.0118
   }
 }

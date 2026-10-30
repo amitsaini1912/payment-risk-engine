@@ -20,6 +20,7 @@ verdict.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -58,6 +59,9 @@ Choose ONE action:
 Respond with ONLY a JSON object, no prose, no code fences:
 {{"action": "allow|hold_for_review|block", "explanation": "<=40 words, cite the \
 specific features that drove your decision", "confidence": <float 0-1>}}"""
+
+
+PROMPT_VERSION = "v1-" + hashlib.sha256(_PROMPT.encode()).hexdigest()[:10]   # on every v1 decision (Day 17)
 
 
 def _build_prompt(txn_id, score, threshold, features) -> str:
@@ -111,6 +115,7 @@ def assess(transaction: dict, *, llm_fn=None, timeout_s: float = DEFAULT_TIMEOUT
     failure_mode = None
     model_score = None
     threshold = None
+    model_version = None
     features: dict = {}
     llm_raw: str | None = None
 
@@ -118,13 +123,14 @@ def assess(transaction: dict, *, llm_fn=None, timeout_s: float = DEFAULT_TIMEOUT
     try:
         scorer = load_scorer()
         threshold = scorer.threshold
+        model_version = scorer.model_version
         model_score = scorer.score(txn)
         features = scorer.feature_snapshot(txn)
     except (ScoringError, FileNotFoundError) as exc:
         failure_mode = "bad_input"
         verdict = fallback_decide(txn, None, f"bad_input: {exc}")
         return _finalize(txn_id, None, threshold, "fallback", failure_mode,
-                         verdict, {}, None, str(exc), audit_path)
+                         verdict, {}, None, str(exc), audit_path, model_version)
 
     # --- step 2: LLM verdict (failure modes 1 & 2) ---
     prompt = _build_prompt(txn_id, model_score, threshold, features)
@@ -166,11 +172,11 @@ def assess(transaction: dict, *, llm_fn=None, timeout_s: float = DEFAULT_TIMEOUT
         )
 
     return _finalize(txn_id, model_score, threshold, path_used, failure_mode,
-                     verdict, features, llm_raw, error_detail, audit_path)
+                     verdict, features, llm_raw, error_detail, audit_path, model_version)
 
 
 def _finalize(txn_id, model_score, threshold, path_used, failure_mode,
-              verdict, features, llm_raw, error_detail, audit_path) -> dict:
+              verdict, features, llm_raw, error_detail, audit_path, model_version=None) -> dict:
     result = {
         "transaction_id": txn_id,
         "model_score": round(model_score, 4) if model_score is not None else None,
@@ -183,6 +189,8 @@ def _finalize(txn_id, model_score, threshold, path_used, failure_mode,
         "confidence": verdict["confidence"],
         "rules_fired": verdict.get("rules_fired", []),
         "feature_snapshot": features,
+        "model_version": model_version,
+        "prompt_version": PROMPT_VERSION,
     }
     entry = dict(result)
     if error_detail:

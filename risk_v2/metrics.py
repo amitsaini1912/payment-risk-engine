@@ -25,3 +25,7 @@ EXPLANATIONS = Counter("risk_explanations_total", "How /v2 explanations were pro
 BUDGET_EXCEEDED = Counter("risk_budget_exceeded_total", "/v2 decisions that took longer than the budget")
 AUTH_FAILURES = Counter("risk_auth_failures_total", "Requests refused for a missing or wrong API key")
 LLM_IN_FLIGHT = Gauge("risk_llm_calls_in_flight", "LLM calls running on the bounded pool")
+DRIFT_PSI = Gauge("risk_drift_psi", "PSI of live /v2 inputs vs training data (updated on scrape)",
+                  ["model_version", "feature"])
+SHADOW_AGREEMENT = Gauge("risk_shadow_final_action_agreement", "Share of /v2 decisions where the shadow model "
+                         "would have led to the same final action", ["champion", "shadow"])

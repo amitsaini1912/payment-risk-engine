@@ -8,16 +8,27 @@ Methodology (baseline-first):
   3. Histogram Gradient Boosting (balanced)            -> usually the strongest
      on tabular data; still a tree model, so still explainable.
 
-We select the model with the best average precision (area under the
-precision-recall curve), because on a 3%-positive problem PR-AUC is far more
-informative than accuracy or ROC-AUC.
+Split (Portfolio Day 17, fixes weakness #15): 60% train / 20% validation / 20% test, stratified.
+  - models are fitted on TRAIN;
+  - the model is SELECTED and its threshold TUNED on VALIDATION;
+  - TEST is touched once, at the end, for the numbers we report. (Before Day 17 the threshold was tuned on the
+    same test set the metrics came from - slightly optimistic numbers.)
+
+Selection (Day 17): each candidate gets its cost-minimising threshold on VALIDATION (with the precision floor),
+and the candidate with the LOWEST VALIDATION COST wins - we deploy at a threshold and pay in rupees, so that is
+what we compare. Average precision (PR-AUC, threshold-free) is the tie-break and is still reported. (Days 2-16
+selected by AP; on Day 17's data that picked logistic regression at Rs 317,645 validation cost vs random forest's
+Rs 265,274.) The runner-up is saved as the SHADOW
+model: it scores live traffic next to the real model, with no effect on decisions,
+so we can compare them before ever switching (risk_v2/governance.py).
 
 The operating threshold is then chosen by `threshold_analysis.sweep` to minimise
 expected business cost - not left at 0.5.
 
 Output:
-  model/model.pkl      - dict: {pipeline, threshold, costs, metrics, features}
-  model/metrics.json   - metrics for every candidate + the selected model
+  model/model.pkl      - dict: {pipeline, threshold, model_version, drift_reference, metrics, ...}
+  model/shadow.pkl     - the runner-up, same format
+  model/metrics.json   - validation metrics for every candidate + test metrics of the selected model
   model/threshold_cost_curve.png
 
 Run:
@@ -26,9 +37,11 @@ Run:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
 import joblib
 import numpy as np
@@ -46,9 +59,11 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, os.path.dirname(__file__))
+from drift import DRIFT_FEATURES, feature_value, reference  # noqa: E402
 from features import MODEL_FEATURES, build_pipeline, to_model_frame  # noqa: E402
 from threshold_analysis import (  # noqa: E402
     DEFAULT_PRECISION_FLOOR,
+    total_cost,
     DISPUTE_FEE,
     FN_OPS_COST,
     REVIEW_COST,
@@ -59,6 +74,7 @@ from threshold_analysis import (  # noqa: E402
 
 DATA_PATH = "data/transactions.csv"
 MODEL_PATH = "model/model.pkl"
+SHADOW_PATH = "model/shadow.pkl"
 METRICS_PATH = "model/metrics.json"
 PLOT_PATH = "model/threshold_cost_curve.png"
 RANDOM_STATE = 42
@@ -113,120 +129,137 @@ def top_feature_importances(pipeline, X_test, y_test, n: int = 12) -> dict | Non
     }
 
 
+def model_version(name: str, data_bytes: bytes) -> str:
+    """Same data + same code settings -> same version; a retrain on new data -> a new version."""
+    short = {"hist_gradient_boosting": "hgb", "random_forest": "rf", "logistic_regression": "lr"}.get(name, name)
+    digest = hashlib.sha256(data_bytes + f"{name}|{RANDOM_STATE}|{MODEL_FEATURES}".encode()).hexdigest()
+    return f"{short}-{digest[:10]}"
+
+
+def drift_reference(train_df: pd.DataFrame) -> dict:
+    rows = train_df.to_dict("records")
+    return {f: reference([feature_value(r, f) for r in rows]) for f in DRIFT_FEATURES}
+
+
+def at_threshold(y_true, scores, amounts, t: float) -> dict:
+    pred = (scores >= t).astype(int)
+    cm = confusion_matrix(y_true, pred, labels=[0, 1])
+    return {
+        "precision": round(float(precision_score(y_true, pred, zero_division=0)), 4),
+        "recall": round(float(recall_score(y_true, pred, zero_division=0)), 4),
+        "f1": round(float(f1_score(y_true, pred, zero_division=0)), 4),
+        "avg_precision": round(float(average_precision_score(y_true, scores)), 4),
+        "roc_auc": round(float(roc_auc_score(y_true, scores)), 4),
+        "confusion_matrix": {"tn": int(cm[0, 0]), "fp": int(cm[0, 1]), "fn": int(cm[1, 0]), "tp": int(cm[1, 1])},
+        "total_cost_inr": round(float(total_cost(y_true, pred, amounts)), 2),
+    }
+
+
 def main() -> None:
     if not os.path.exists(DATA_PATH):
         sys.exit(f"missing {DATA_PATH} - run: python data/generate_data.py")
 
+    with open(DATA_PATH, "rb") as fh:
+        data_bytes = fh.read()
     df = pd.read_csv(DATA_PATH)
-    train_df, test_df = train_test_split(
-        df, test_size=0.2, random_state=RANDOM_STATE, stratify=df["is_chargeback"]
-    )
+    rest_df, test_df = train_test_split(df, test_size=0.2, random_state=RANDOM_STATE, stratify=df["is_chargeback"])
+    train_df, val_df = train_test_split(rest_df, test_size=0.25, random_state=RANDOM_STATE,
+                                        stratify=rest_df["is_chargeback"])      # 0.25 x 0.8 = 20% of all
     X_train, y_train = to_model_frame(train_df), train_df["is_chargeback"].to_numpy()
+    X_val, y_val = to_model_frame(val_df), val_df["is_chargeback"].to_numpy()
     X_test, y_test = to_model_frame(test_df), test_df["is_chargeback"].to_numpy()
-    amounts_test = test_df["amount"].to_numpy()
 
-    print(f"train rows {len(train_df):,} (chargebacks {int(y_train.sum())}) | "
-          f"test rows {len(test_df):,} (chargebacks {int(y_test.sum())})")
+    print(f"train {len(train_df):,} ({int(y_train.sum())} cb) | validation {len(val_df):,} "
+          f"({int(y_val.sum())} cb) | test {len(test_df):,} ({int(y_test.sum())} cb)")
 
-    results = {}
-    fitted = {}
+    results, fitted, sweeps = {}, {}, {}
     for name, clf in candidate_models().items():
         pipe = build_pipeline(clf)
         pipe.fit(X_train, y_train)
-        scores = pipe.predict_proba(X_test)[:, 1]
-        results[name] = evaluate_at_half(y_test, scores)
+        val_scores = pipe.predict_proba(X_val)[:, 1]
+        results[name] = evaluate_at_half(y_val, val_scores)
+        sweeps[name] = sweep(y_val, val_scores, val_df["amount"].to_numpy())
+        results[name]["validation_cost_at_threshold_inr"] = sweeps[name][0].total_cost
         fitted[name] = pipe
-        print(f"  {name:24s} AP={results[name]['avg_precision']:.3f} "
-              f"ROC-AUC={results[name]['roc_auc']:.3f} "
-              f"R@0.5={results[name]['recall@0.5']:.3f}")
+        print(f"  {name:24s} val cost Rs {sweeps[name][0].total_cost:>9,.0f} at {sweeps[name][0].threshold:.3f}  "
+              f"AP={results[name]['avg_precision']:.3f} ROC-AUC={results[name]['roc_auc']:.3f}")
 
-    best_name = max(results, key=lambda n: results[n]["avg_precision"])
-    best_pipe = fitted[best_name]
-    print(f"\nselected model: {best_name} (best average precision)")
+    ranked = sorted(results, key=lambda n: (sweeps[n][0].total_cost, -results[n]["avg_precision"]))
+    trained_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    drift_ref = drift_reference(train_df)
+    bundles = {}
+    for role, name in (("champion", ranked[0]), ("shadow", ranked[1])):
+        pipe = fitted[name]
+        thr, thr_unconstrained, curve = sweeps[name]
+        test_scores = pipe.predict_proba(X_test)[:, 1]
+        test = at_threshold(y_test, test_scores, test_df["amount"].to_numpy(), thr.threshold)
+        bundles[role] = {
+            "pipeline": pipe, "model_name": name, "role": role, "threshold": thr.threshold,
+            "model_version": model_version(name, data_bytes), "trained_at": trained_at,
+            "data_sha256": hashlib.sha256(data_bytes).hexdigest(),
+            "raw_feature_order": MODEL_FEATURES, "drift_reference": drift_ref,
+            "costs_inr": {"fn_dispute_fee": DISPUTE_FEE, "fn_ops_cost": FN_OPS_COST, "fp_review_cost": REVIEW_COST},
+            "metrics": test, "sklearn_random_state": RANDOM_STATE,
+            "_curve": curve, "_thr": thr, "_thr_unconstrained": thr_unconstrained,
+        }
+        print(f"\n{role}: {name} {bundles[role]['model_version']} threshold {thr.threshold:.4f} (validation) -> "
+              f"TEST precision {test['precision']:.3f} recall {test['recall']:.3f} AP {test['avg_precision']:.3f} "
+              f"cost Rs {test['total_cost_inr']:,.0f}")
 
-    # --- cost-based threshold on the test set ---
-    best_scores = best_pipe.predict_proba(X_test)[:, 1]
-    thr_result, thr_unconstrained, curve = sweep(y_test, best_scores, amounts_test)
-    print_report(thr_result, thr_unconstrained, curve)
-    save_plot(curve, thr_result.threshold, PLOT_PATH, thr_unconstrained.threshold)
-
-    t = thr_result.threshold
-    pred_t = (best_scores >= t).astype(int)
-    cm = confusion_matrix(y_test, pred_t)
+    champ = bundles["champion"]
+    print_report(champ["_thr"], champ["_thr_unconstrained"], champ["_curve"])
+    save_plot(champ["_curve"], champ["threshold"], PLOT_PATH, champ["_thr_unconstrained"].threshold)
+    thr, thr_u, test = champ["_thr"], champ["_thr_unconstrained"], champ["metrics"]
     selected_metrics = {
-        "threshold": t,
+        "threshold": champ["threshold"],
         "threshold_rationale": (
-            "cost-minimising threshold on the held-out test set, subject to a "
-            f"precision floor of {DEFAULT_PRECISION_FLOOR} (manual-review capacity "
-            "constraint). See threshold_analysis.py."
+            "cost-minimising threshold on the VALIDATION set, subject to a precision floor of "
+            f"{DEFAULT_PRECISION_FLOOR} (manual-review capacity constraint); precision/recall/cost below are on "
+            "the untouched TEST set. See threshold_analysis.py."
         ),
-        "threshold_unconstrained": {
-            "threshold": thr_unconstrained.threshold,
-            "precision": thr_unconstrained.precision,
-            "recall": thr_unconstrained.recall,
-            "total_cost_inr": thr_unconstrained.total_cost,
-        },
+        "threshold_unconstrained": {"threshold": thr_u.threshold, "precision_val": thr_u.precision,
+                                    "recall_val": thr_u.recall, "total_cost_val_inr": thr_u.total_cost},
         "precision_floor": DEFAULT_PRECISION_FLOOR,
-        "precision": round(float(precision_score(y_test, pred_t, zero_division=0)), 4),
-        "recall": round(float(recall_score(y_test, pred_t, zero_division=0)), 4),
-        "f1": round(float(f1_score(y_test, pred_t, zero_division=0)), 4),
-        "avg_precision": results[best_name]["avg_precision"],
-        "roc_auc": results[best_name]["roc_auc"],
-        "confusion_matrix": {
-            "tn": int(cm[0, 0]), "fp": int(cm[0, 1]),
-            "fn": int(cm[1, 0]), "tp": int(cm[1, 1]),
-        },
+        **{k: test[k] for k in ("precision", "recall", "f1", "avg_precision", "roc_auc", "confusion_matrix")},
+        "validation": {"precision": thr.precision, "recall": thr.recall, "total_cost_inr": thr.total_cost},
         "cost": {
-            "assumptions_inr": {
-                "fn_dispute_fee": DISPUTE_FEE,
-                "fn_ops_cost": FN_OPS_COST,
-                "fn_amount": "actual transaction amount",
-                "fp_review_cost": REVIEW_COST,
-            },
-            "total_cost_at_threshold_inr": thr_result.total_cost,
-            "cost_per_txn_inr": thr_result.cost_per_txn,
-            "baseline_cost_approve_all_inr": thr_result.baseline_cost_approve_all,
-            "baseline_cost_review_all_inr": thr_result.baseline_cost_review_all,
+            "assumptions_inr": {"fn_dispute_fee": DISPUTE_FEE, "fn_ops_cost": FN_OPS_COST,
+                                "fn_amount": "actual transaction amount", "fp_review_cost": REVIEW_COST},
+            "total_cost_at_threshold_inr": test["total_cost_inr"],
+            "cost_per_txn_inr": round(test["total_cost_inr"] / len(test_df), 2),
+            "baseline_cost_approve_all_inr": round(float(total_cost(y_test, np.zeros_like(y_test),
+                                                                   test_df["amount"].to_numpy())), 2),
+            "baseline_cost_review_all_inr": round(float(total_cost(y_test, np.ones_like(y_test),
+                                                                  test_df["amount"].to_numpy())), 2),
         },
     }
-
     metrics = {
-        "dataset": {
-            "rows": len(df),
-            "chargeback_rate": round(float(df["is_chargeback"].mean()), 4),
-            "test_rows": len(test_df),
-            "test_chargebacks": int(y_test.sum()),
-        },
-        "candidates_at_threshold_0.5": results,
-        "selected_model": best_name,
+        "dataset": {"rows": len(df), "chargeback_rate": round(float(df["is_chargeback"].mean()), 4),
+                    "split": {"train": len(train_df), "validation": len(val_df), "test": len(test_df)},
+                    "test_rows": len(test_df), "test_chargebacks": int(y_test.sum()),
+                    "data_sha256": champ["data_sha256"]},
+        "selection": "lowest validation cost at the validation-tuned threshold (precision floor), tie-break AP",
+        "candidates_validation": results,
+        "selected_model": champ["model_name"],
+        "model_version": champ["model_version"],
+        "trained_at": trained_at,
         "selected": selected_metrics,
-        "top_feature_importances": top_feature_importances(best_pipe, X_test, y_test),
+        "shadow": {"model_name": bundles["shadow"]["model_name"],
+                   "model_version": bundles["shadow"]["model_version"],
+                   "threshold": bundles["shadow"]["threshold"], "test": bundles["shadow"]["metrics"]},
+        "top_feature_importances": top_feature_importances(champ["pipeline"], X_test, y_test),
     }
     with open(METRICS_PATH, "w") as fh:
         json.dump(metrics, fh, indent=2)
     print(f"\nwrote {METRICS_PATH}")
+    for role, path in (("champion", MODEL_PATH), ("shadow", SHADOW_PATH)):
+        joblib.dump({k: v for k, v in bundles[role].items() if not k.startswith("_")}, path)
+        print(f"wrote {path} ({role})")
 
-    bundle = {
-        "pipeline": best_pipe,
-        "model_name": best_name,
-        "threshold": t,
-        "raw_feature_order": MODEL_FEATURES,
-        "costs_inr": {
-            "fn_dispute_fee": DISPUTE_FEE,
-            "fn_ops_cost": FN_OPS_COST,
-            "fp_review_cost": REVIEW_COST,
-        },
-        "metrics": selected_metrics,
-        "sklearn_random_state": RANDOM_STATE,
-    }
-    joblib.dump(bundle, MODEL_PATH)
-    print(f"wrote {MODEL_PATH}")
-
-    if metrics["selected"]["recall"] < 0.75:
-        print("\nWARNING: recall below the 0.75 acceptance bar - iterate on the model.")
+    if test["recall"] < 0.75:
+        print("\nWARNING: test recall below the 0.75 acceptance bar - iterate on the model.")
     else:
-        print(f"\nrecall {metrics['selected']['recall']:.3f} meets the >=0.75 bar "
-              f"at precision {metrics['selected']['precision']:.3f}")
+        print(f"\ntest recall {test['recall']:.3f} meets the >=0.75 bar at precision {test['precision']:.3f}")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,8 @@ import os
 import threading
 from datetime import datetime, timezone
 
+from pci import scrub
+
 _LOCK = threading.Lock()
 
 DEFAULT_PATH = os.environ.get(
@@ -37,7 +39,9 @@ def write_entry(entry: dict, path: str | None = None) -> dict:
     """Append one entry. Never raises to the caller - a logging failure must not
     take down the decision path - but it does record that logging failed."""
     path = _path(path)
-    record = {"logged_at": _utcnow(), **entry}
+    # PAN-looking text and emails are masked before anything is written (Day 17): the audit trail must never
+    # become a store of card data, whatever an LLM echoed or an error message contained
+    record = scrub({"logged_at": _utcnow(), **entry})
     line = json.dumps(record, default=str)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)

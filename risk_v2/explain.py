@@ -9,6 +9,7 @@ In practice a ~1 s Gemini call rarely fits: the template is the normal explanati
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from typing import Callable, Optional
@@ -32,6 +33,9 @@ Reasons (code, where it came from, evidence):
 {reasons}
 
 Respond with ONLY a JSON object: {{"explanation": "<text>"}}"""
+
+# changes whenever the prompt text changes; on every decision (Day 17), so an explanation can be traced to its prompt
+PROMPT_VERSION = "v2-" + hashlib.sha256(_PROMPT.encode()).hexdigest()[:10]
 
 
 def template(action: str, reasons: list[dict], model_score: Optional[float]) -> str:

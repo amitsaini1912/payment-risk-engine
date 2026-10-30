@@ -19,6 +19,11 @@ MODEL_PATH = os.environ.get(
     "MODEL_PATH",
     os.path.join(os.path.dirname(__file__), "model.pkl"),
 )
+# Optional challenger: scores live /v2 traffic next to the real model, never affects a decision (Day 17).
+SHADOW_PATH = os.environ.get(
+    "SHADOW_MODEL_PATH",
+    os.path.join(os.path.dirname(__file__), "shadow.pkl"),
+)
 
 
 # Threads for the model's OpenMP pool. A risk call scores 1-11 rows: more threads don't help, and when the machine
@@ -33,10 +38,19 @@ class ScoringError(ValueError):
 class Scorer:
     def __init__(self, bundle: dict):
         self.pipeline = bundle["pipeline"]
+        # models trained with n_jobs=-1 (random forest) would start a worker per core for every 1-11 row predict:
+        # p50 39 ms vs 15 ms with 1 job (Day 17). Same reasoning as MODEL_THREADS for OpenMP.
+        for _name, step in self.pipeline.steps:
+            if hasattr(step, "n_jobs"):
+                step.n_jobs = MODEL_THREADS
         self.threshold: float = bundle["threshold"]
         self.model_name: str = bundle.get("model_name", "unknown")
         self.costs: dict = bundle.get("costs_inr", {})
         self.metrics: dict = bundle.get("metrics", {})
+        # bundles from before Day 17 have no version: name it after the model so decisions still carry something
+        self.model_version: str = bundle.get("model_version", f"{self.model_name}-unversioned")
+        self.role: str = bundle.get("role", "champion")
+        self.drift_reference: dict = bundle.get("drift_reference", {})
 
     def _validate(self, txn: dict) -> None:
         missing = [f for f in REQUIRED_RAW_FIELDS if f not in txn or txn[f] is None]
@@ -103,4 +117,13 @@ def load_scorer(path: str = MODEL_PATH) -> Scorer:
             f"{path} not found - run `python model/train.py` first."
         )
     threadpool_limits(limits=MODEL_THREADS, user_api="openmp")  # process-wide, stays in force
+    return Scorer(joblib.load(path))
+
+
+@lru_cache(maxsize=1)
+def load_shadow(path: str = SHADOW_PATH) -> Scorer | None:
+    """The shadow model, or None when there is none (no file = no shadow scoring)."""
+    if not os.path.exists(path):
+        return None
+    load_scorer()  # same thread limits
     return Scorer(joblib.load(path))

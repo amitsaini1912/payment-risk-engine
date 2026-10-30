@@ -9,6 +9,7 @@ venv/
 logs/
 data/transactions.csv
 model/model.pkl
+model/shadow.pkl
 tests/
 dashboard/
 learning_notes/

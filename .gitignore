@@ -15,6 +15,7 @@ data/transactions.csv
 
 # --- Model artifacts (regenerate via model/train.py) ---
 model/model.pkl
+model/shadow.pkl
 
 # --- Runtime logs (sample entry shown in README) ---
 logs/*.jsonl

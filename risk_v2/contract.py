@@ -5,6 +5,8 @@ Nothing in here is a risk feature. Counts, averages, account age, chargeback his
 from what it has seen (risk_v2/store.py), so a caller can't make a transaction look safe by sending
 `past_chargebacks=0` (weakness #14). Extra fields are rejected.
 
+No field may contain a card number (PAN): only card-vault tokens and fingerprints (Day 17, agent/pci.py).
+
 Money is an integer in minor units (paise, cents) plus an ISO 4217 code, like billing's Money - never a float.
 """
 
@@ -14,7 +16,8 @@ from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, IPv6Address
 from typing import Literal, Optional, Union
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pci import reject_pans
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 ID = r"^[A-Za-z0-9_.:\-]+$"
 MAX_CLOCK_SKEW = timedelta(minutes=5)
@@ -45,6 +48,12 @@ class AssessV2Request(BaseModel):
     billing_country: Optional[str] = Field(default=None, pattern=r"^[A-Z]{2}$")
     ip_country: Optional[str] = Field(default=None, pattern=r"^[A-Z]{2}$")
     email_domain: Optional[str] = Field(default=None, max_length=255, pattern=r"^[a-z0-9.\-]+\.[a-z]{2,}$")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_card_numbers(cls, values):
+        reject_pans(values)
+        return values
 
     @field_validator("timestamp")
     @classmethod

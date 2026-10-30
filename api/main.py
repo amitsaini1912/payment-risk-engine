@@ -29,8 +29,11 @@ from functools import lru_cache
 from typing import Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)  # the risk_v2 package
@@ -41,6 +44,7 @@ import llm_pool  # noqa: E402
 from audit import get_by_transaction_id, recent, write_entry  # noqa: E402
 from failure_sim import SIMULATIONS  # noqa: E402
 from llm_client import DEFAULT_MODEL, is_configured  # noqa: E402
+from pci import install_log_masking, mask, reject_pans  # noqa: E402
 from reasoning_agent import assess  # noqa: E402
 from risk_v2 import metrics as m  # noqa: E402
 from risk_v2.assembler import UnsupportedCurrency, amount_in_inr_minor, to_model_transaction  # noqa: E402
@@ -49,9 +53,13 @@ from risk_v2.budget import Deadline  # noqa: E402
 from risk_v2.contract import AssessV2Request  # noqa: E402
 from risk_v2.decision import decide  # noqa: E402
 from risk_v2.decisions import DecisionConflict, DecisionStore, request_hash  # noqa: E402
+from risk_v2.governance import Governance  # noqa: E402
 from risk_v2.rules import RuleBook, RuleLoader, RulesUnavailable  # noqa: E402
 from risk_v2.store import FeatureStore, FeaturesUnavailable  # noqa: E402
-from scorer import load_scorer  # noqa: E402
+from scorer import load_scorer, load_shadow  # noqa: E402
+
+
+install_log_masking()   # every log line, incl. uvicorn's access log: PANs/emails masked (Day 17)
 
 
 @asynccontextmanager
@@ -71,6 +79,14 @@ app = FastAPI(
     description="Chargeback-risk scoring + LLM reasoning agent with deterministic fallback.",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    """422 without echoing what was sent: FastAPI's default puts each bad value in "input" - a PAN in a wrong field
+    would be sent back (and logged by whatever logs responses). Only where + why."""
+    errors = [{"loc": e.get("loc"), "type": e.get("type"), "msg": mask(str(e.get("msg", "")))} for e in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
 
 
 @app.middleware("http")
@@ -128,6 +144,12 @@ class TransactionIn(BaseModel):
     txn_count_24h: int = Field(ge=0)
     email_is_disposable: int = Field(default=0, ge=0, le=1)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _no_card_numbers(cls, values):
+        reject_pans(values)   # Day 17: a PAN in any field -> 422 (agent/pci.py)
+        return values
+
     @field_validator("payment_method")
     @classmethod
     def _pm(cls, v: str) -> str:
@@ -154,6 +176,8 @@ class Verdict(BaseModel):
     confidence: float
     rules_fired: list[str]
     feature_snapshot: dict
+    model_version: Optional[str] = None    # Day 17: which model / prompt produced this verdict
+    prompt_version: Optional[str] = None
 
 
 _rule_loader = RuleLoader(os.environ.get("RULES_PATH", os.path.join(_ROOT, "rules.yaml")))
@@ -177,12 +201,6 @@ def health(loader: RuleLoader = Depends(get_rule_loader)) -> dict:
         "rules_version": rules_version,   # the version /v2 decisions use right now
         "rules_error": loader.last_error,  # why the newest rules.yaml was rejected (the old version keeps running)
     }
-
-
-@app.get("/metrics/prometheus")
-def prometheus_metrics() -> Response:
-    m.LLM_IN_FLIGHT.set(llm_pool.in_flight())
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/metrics")
@@ -233,6 +251,10 @@ class VerdictV2(BaseModel):
     reasons: list[dict]              # each code with its source (rule / model / engine) and evidence
     rules_fired: list[str]
     rules_version: str
+    model_version: Optional[str]     # Day 17: model, rules and prompt versions on every decision
+    prompt_version: str
+    model_action: Optional[str]      # the model band alone (before rules)
+    shadow: Optional[dict]           # shadow model's score/actions - recorded only, never used (docs/adr/0004)
     model_score: Optional[float]
     threshold: Optional[float]       # review band start = the model bundle's threshold
     block_at: float
@@ -262,6 +284,10 @@ def get_decision_store(store: FeatureStore = Depends(get_feature_store)) -> Deci
     return DecisionStore(store.client)
 
 
+def get_governance(store: FeatureStore = Depends(get_feature_store)) -> Governance:
+    return Governance(store.client)
+
+
 def get_explainer() -> Optional[Callable[[str], str]]:
     """The LLM call for explanations; None = Gemini if a key is set, else the template. Tests override this."""
     return None
@@ -285,6 +311,7 @@ def assess_v2(req: AssessV2Request, caller: str = Depends(require_caller),
               store: FeatureStore = Depends(get_feature_store),
               decisions: DecisionStore = Depends(get_decision_store),
               book: RuleBook = Depends(get_rulebook),
+              governance: Governance = Depends(get_governance),
               explainer: Optional[Callable[[str], str]] = Depends(get_explainer)) -> dict:
     """Billing sends facts; every risk feature is computed here (weakness #14). Old /assess is unchanged.
 
@@ -330,6 +357,8 @@ def assess_v2(req: AssessV2Request, caller: str = Depends(require_caller),
         return {**kept, "replayed": True}
 
     write_entry({**decision, "caller": caller})
+    if decision["model_score"] is not None:
+        governance.record(decision, model_input, load_scorer().drift_reference)
     m.DECISIONS.labels("v2", decision["action"], decision["path_used"]).inc()
     m.EXPLANATIONS.labels(decision["explanation_source"], decision["failure_mode"] or "none").inc()
     if decision["action"] != "allow":
@@ -344,7 +373,7 @@ def assess_v2(req: AssessV2Request, caller: str = Depends(require_caller),
 def get_audit(transaction_id: str, _caller: str = Depends(require_caller)) -> dict:
     entry = get_by_transaction_id(transaction_id)
     if entry is None:
-        raise HTTPException(status_code=404, detail=f"no audit entry for {transaction_id}")
+        raise HTTPException(status_code=404, detail=f"no audit entry for {mask(transaction_id)}")   # no PAN echo
     return entry
 
 
@@ -371,3 +400,35 @@ def ready(loader: RuleLoader = Depends(get_rule_loader), keys: ApiKeys = Depends
     ok = all(v == "ok" for v in checks.values())
     return Response(content=json.dumps({"ready": ok, "checks": checks}),
                     status_code=200 if ok else 503, media_type="application/json")
+
+
+@app.get("/governance/shadow")
+def shadow_report(_caller: str = Depends(require_caller), governance: Governance = Depends(get_governance)) -> dict:
+    """Champion vs shadow on live /v2 traffic since this champion went live (docs/adr/0004)."""
+    shadow = load_shadow()
+    return governance.shadow_report(load_scorer().model_version, shadow.model_version if shadow else None)
+
+
+@app.get("/governance/drift")
+def drift_report(_caller: str = Depends(require_caller), governance: Governance = Depends(get_governance)) -> dict:
+    """PSI of live /v2 traffic against the champion's training data, per key feature (model/drift.py)."""
+    scorer = load_scorer()
+    return governance.drift_report(scorer.model_version, scorer.drift_reference)
+
+
+@app.get("/metrics/prometheus")
+def prometheus_metrics(governance: Governance = Depends(get_governance)) -> Response:
+    m.LLM_IN_FLIGHT.set(llm_pool.in_flight())
+    try:   # drift + shadow agreement as gauges, from the shared Redis counters
+        scorer, shadow = load_scorer(), load_shadow()
+        for feature, row in governance.drift_report(scorer.model_version, scorer.drift_reference)["features"].items():
+            if row["psi"] is not None:
+                m.DRIFT_PSI.labels(scorer.model_version, feature).set(row["psi"])
+        if shadow is not None:
+            report = governance.shadow_report(scorer.model_version, shadow.model_version)
+            if report["n"]:
+                m.SHADOW_AGREEMENT.labels(scorer.model_version, shadow.model_version).set(
+                    report["final_action_agreement"])
+    except Exception:  # noqa: BLE001 - Redis or model trouble shows in /ready; metrics still served
+        pass
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

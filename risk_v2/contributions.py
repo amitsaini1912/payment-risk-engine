@@ -1,7 +1,8 @@
 """
 Why did the MODEL score this payment high? Per-reason contributions without SHAP (docs/adr/0002).
 
-The model is gradient-boosted trees (no coefficients to read). For each reason code we take the payment, put that
+Works for any model (Day 15: gradient-boosted trees, Day 17: a random forest - neither has coefficients to read;
+the shadow is logistic regression). For each reason code we take the payment, put that
 reason's inputs back to a normal value ("what if this customer weren't new?"), and score again:
 
     contribution(R) = score(payment) - score(payment with R's inputs made normal)

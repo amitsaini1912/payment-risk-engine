@@ -33,11 +33,11 @@ def write(path, text: str) -> None:
 
 
 def known_customer(client, clock, customer="cust-known"):
-    """Five normal orders over 50 days on one phone: a settled customer the model trusts."""
+    """Five orders 80 days apart on one phone (devices are remembered 90 days): a settled customer."""
     for _ in range(5):
         assess(client, customer_id=customer, device_id="phone", amount_minor=150_000,
                card_fingerprint="fp" + "k" * 62)
-        clock.advance(10 * 86_400)
+        clock.advance(80 * 86_400)
 
 
 # ---- decisions ----
@@ -88,7 +88,9 @@ def test_model_only_decision_names_the_features_that_drove_it(v2_client):
     body = assess(v2_client, amount_minor=700_000, email_domain="mailinator.com")
     assert body["rules_fired"] == []
     assert body["action"] in ("hold_for_review", "block")
-    assert body["reason_codes"][0] == "R08_DISPOSABLE_EMAIL"
+    # the training pattern is "disposable email AND >= Rs 6,000": both must be named; which one leads depends on
+    # the model (Day 15 hgb: email first; Day 17 random forest: amount first)
+    assert {"R08_DISPOSABLE_EMAIL", "R02_AMOUNT_ANOMALY"} <= set(body["reason_codes"])
     assert all(r["source"] == "model" for r in body["reasons"])
     contributions = [r["contribution"] for r in body["reasons"]]
     assert contributions == sorted(contributions, reverse=True) and contributions[0] >= 0.02

@@ -229,15 +229,22 @@ def generate(rows: int, seed: int) -> pd.DataFrame:
                 round(rng.uniform(50, 700), 2),
             ))
 
-    records = []
-    for n in range(rows):
+    # Decide WHO pays WHEN first, then walk the events in time order, so the velocity counts below only see
+    # EARLIER payments. (Before Portfolio Day 17 rows were generated in random time order and txn_count_1h had no
+    # lower bound, so it also counted the customer's LATER payments: 1h mean 1.1 > 24h mean 0.0.)
+    events = []
+    for _ in range(rows):
         forced = burst_queue.pop() if (burst_queue and rng.random() < 0.5) else None
         cid = forced[0] if forced else rng.choice(customer_ids)
+        ts = forced[1] if forced else start + timedelta(seconds=rng.randint(0, 120 * 24 * 3600))
+        events.append((ts, cid, forced))
+    events.sort(key=lambda e: e[0])
+
+    records = []
+    for n, (ts, cid, forced) in enumerate(events):
         mid = rng.choice(merchant_ids)
         cust = customers[cid]
         merch = merchants[mid]
-
-        ts = forced[1] if forced else start + timedelta(seconds=rng.randint(0, 120 * 24 * 3600))
         hour = ts.hour
 
         method = np.random.choice(PAYMENT_METHODS, p=PAYMENT_METHOD_WEIGHTS)
@@ -256,8 +263,9 @@ def generate(rows: int, seed: int) -> pd.DataFrame:
 
         # Velocity: how many txns has this customer had in the last hour / 24h?
         hist = recent.setdefault(cid, [])
-        txn_count_1h = sum(1 for t in hist if (ts - t).total_seconds() <= 3600)
+        txn_count_1h = sum(1 for t in hist if 0 <= (ts - t).total_seconds() <= 3600)
         txn_count_24h = sum(1 for t in hist if 0 <= (ts - t).total_seconds() <= 86400)
+        assert txn_count_1h <= txn_count_24h
         hist.append(ts)
 
         # Device / geo
