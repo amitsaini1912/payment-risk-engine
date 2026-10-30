@@ -2,6 +2,7 @@
 FastAPI service exposing the risk agent.
 
   POST /assess              transaction -> verdict (also written to the audit trail)
+  POST /v2/assess           FACTS from billing -> engine computes velocity/profile itself (Redis) -> verdict
   GET  /audit/{txn_id}      retrieve the logged decision for a transaction
   GET  /audit               recent decisions (dashboard convenience)
   GET  /metrics             Day-2 model metrics
@@ -18,10 +19,11 @@ import sys
 import uuid
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)  # the risk_v2 package
 for sub in ("agent", "model"):
     sys.path.insert(0, os.path.join(_ROOT, sub))
 
@@ -29,6 +31,9 @@ from audit import get_by_transaction_id, recent  # noqa: E402
 from failure_sim import SIMULATIONS  # noqa: E402
 from llm_client import DEFAULT_MODEL, is_configured  # noqa: E402
 from reasoning_agent import assess  # noqa: E402
+from risk_v2.assembler import UnsupportedCurrency, amount_in_inr_minor, to_model_transaction  # noqa: E402
+from risk_v2.contract import AssessV2Request  # noqa: E402
+from risk_v2.store import FeatureStore, FeaturesUnavailable  # noqa: E402
 
 app = FastAPI(
     title="Razorpay Risk Agent",
@@ -133,6 +138,45 @@ def assess_transaction(txn: TransactionIn, simulate: Optional[str] = None) -> di
         raise
     except Exception as exc:  # noqa: BLE001 - assess() shouldn't raise, but never 500 silently
         raise HTTPException(status_code=500, detail=f"assessment failed: {exc}") from exc
+
+
+class VerdictV2(Verdict):
+    api_version: str
+    signals: dict      # what the engine computed itself (velocity, profile, card) - see docs/adr/0001
+    model_input: dict  # the exact raw transaction the model scored (facts + signals mapped to its features)
+
+
+_feature_store: Optional[FeatureStore] = None
+
+
+def get_feature_store() -> FeatureStore:
+    """One Redis-backed store per process. REDIS_URL, default redis://localhost:6379/0. Tests override this."""
+    global _feature_store
+    if _feature_store is None:
+        _feature_store = FeatureStore.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+    return _feature_store
+
+
+@app.post("/v2/assess", response_model=VerdictV2)
+def assess_v2(req: AssessV2Request, store: FeatureStore = Depends(get_feature_store)) -> dict:
+    """Billing sends facts; every risk feature is computed here (weakness #14). Old /assess is unchanged.
+
+    422: invalid facts or an unsupported currency. 503: the feature store (Redis) is unavailable - we never score
+    with made-up "0 earlier payments" velocity; the caller uses its own fallback.
+    """
+    try:
+        inr_minor = amount_in_inr_minor(req.amount_minor, req.currency)
+    except UnsupportedCurrency as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        signals = store.observe(transaction_id=req.transaction_id, customer_id=req.customer_id,
+                                card_fingerprint=req.card_fingerprint, device_id=req.device_id,
+                                ip=str(req.ip), amount_inr_minor=inr_minor)
+    except FeaturesUnavailable as exc:
+        raise HTTPException(status_code=503, detail="risk features unavailable, use fallback") from exc
+    model_input = to_model_transaction(req, signals, inr_minor)
+    verdict = assess(model_input)
+    return {**verdict, "api_version": "v2", "signals": signals.as_dict(), "model_input": model_input}
 
 
 @app.get("/audit/{transaction_id}")

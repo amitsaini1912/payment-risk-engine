@@ -42,7 +42,8 @@ def _api_key() -> str | None:
 
 
 def is_configured() -> bool:
-    return _api_key() is not None
+    # bool(), not "is not None": an empty GEMINI_API_KEY= is not a key (/health said "configured" for it)
+    return bool(_api_key())
 
 
 def call_gemini(prompt: str, model: str = DEFAULT_MODEL,

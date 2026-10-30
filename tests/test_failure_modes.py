@@ -149,3 +149,10 @@ def test_never_raises(high_risk_transaction, audit_path, n):
     assert isinstance(result, dict)
     assert result["action"] in VALID_ACTIONS
     assert result["path_used"] == "fallback"
+
+
+def test_empty_api_key_is_not_configured(monkeypatch):
+    import llm_client
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("GOOGLE_API_KEY", "")
+    assert llm_client.is_configured() is False
