@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/amitsaini1912/razorpay-risk-agent/docs/contracts/payment.outcome.v1.schema.json",
+  "title": "payment.outcome v1",
+  "description": "billing-service -> Kafka topic `payment.outcome` -> risk engine (docs/adr/0006). What happened to a payment after the risk decision: it was captured (money moved, so it CAN charge back), or a person approved / rejected a held payment. Message value = this JSON (UTF-8), key = transaction_id. Unknown fields are ignored; a breaking change gets schema_version 2.",
+  "type": "object",
+  "required": ["event_id", "transaction_id", "outcome", "amount_minor", "currency", "occurred_at", "schema_version"],
+  "additionalProperties": true,
+  "properties": {
+    "event_id": {
+      "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_.:\\-]+$",
+      "description": "unique per event (billing's outbox id); a redelivered event is stored once"
+    },
+    "transaction_id": {
+      "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_.:\\-]+$",
+      "description": "the same id billing sent to POST /v2/assess for this payment"
+    },
+    "outcome": {
+      "enum": ["captured", "review_approved", "review_rejected"],
+      "description": "captured: money taken (amount = captured amount); review_*: a person's decision on a held payment"
+    },
+    "amount_minor": {"type": "integer", "exclusiveMinimum": 0, "maximum": 1000000000000},
+    "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+    "occurred_at": {"type": "string", "format": "date-time", "description": "ISO-8601 with a UTC offset"},
+    "schema_version": {"const": 1}
+  },
+  "examples": [
+    {
+      "event_id": "9c3e1f0a-5d2b-4a7e-8f61-2b9d0c4e7a15",
+      "transaction_id": "pay-7f3a9c",
+      "outcome": "captured",
+      "amount_minor": 150000,
+      "currency": "INR",
+      "occurred_at": "2026-10-31T05:38:02.376Z",
+      "schema_version": 1
+    }
+  ]
+}

@@ -1,12 +1,13 @@
 """
-Send `chargeback.created` events the way billing-service will (Day 19): JSON value per
-docs/contracts/chargeback.created.v1.schema.json, key = transaction_id. Stands in for billing until then (PLAN
-section 3 item 9) and is what the contract test (tests/test_chargeback_kafka.py) produces with.
+Send feedback events the way billing-service does (Day 19b): JSON values per docs/contracts/ (chargeback.created v1,
+payment.outcome v1), key = transaction_id. Stood in for billing before Day 19b (PLAN section 3 item 9); still what
+the contract tests (tests/test_chargeback_kafka.py) produce with, and handy by hand.
 
-  python scripts/produce_chargeback.py pay-123                          # one chargeback for payment pay-123
-  python scripts/produce_chargeback.py pay-123 --amount-minor 50000 --reason product_not_received
-  python scripts/produce_chargeback.py pay-123 --event-id evt-1          # run twice: stored once
-  python scripts/produce_chargeback.py --raw '{"oops": 1}'               # a bad event -> chargeback.created.DLT
+  python scripts/produce_feedback.py pay-123                          # one chargeback for payment pay-123
+  python scripts/produce_feedback.py pay-123 --amount-minor 50000 --reason product_not_received
+  python scripts/produce_feedback.py pay-123 --event-id evt-1          # run twice: stored once
+  python scripts/produce_feedback.py pay-123 --outcome captured        # payment.outcome instead of a chargeback
+  python scripts/produce_feedback.py --raw '{"oops": 1}'               # a bad event -> chargeback.created.DLT
 
   --bootstrap (default $KAFKA_BOOTSTRAP_SERVERS or localhost:9092)
 """
@@ -23,6 +24,7 @@ from typing import Optional
 from confluent_kafka import Producer
 
 TOPIC = "chargeback.created"
+OUTCOME_TOPIC = "payment.outcome"
 
 
 def chargeback(transaction_id: str, *, amount_minor: int = 150_000, currency: str = "INR", reason: str = "fraud",
@@ -34,6 +36,19 @@ def chargeback(transaction_id: str, *, amount_minor: int = 150_000, currency: st
         "currency": currency,
         "reason": reason,
         "created_at": (created_at or datetime.now(timezone.utc)).isoformat(),
+        "schema_version": 1,
+    }
+
+
+def outcome(transaction_id: str, kind: str = "captured", *, amount_minor: int = 150_000, currency: str = "INR",
+            event_id: Optional[str] = None, occurred_at: Optional[datetime] = None) -> dict:
+    return {
+        "event_id": event_id or str(uuid.uuid4()),
+        "transaction_id": transaction_id,
+        "outcome": kind,
+        "amount_minor": amount_minor,
+        "currency": currency,
+        "occurred_at": (occurred_at or datetime.now(timezone.utc)).isoformat(),
         "schema_version": 1,
     }
 
@@ -59,6 +74,8 @@ def main() -> None:
     p.add_argument("--currency", default="INR")
     p.add_argument("--reason", default="fraud")
     p.add_argument("--event-id")
+    p.add_argument("--outcome", choices=["captured", "review_approved", "review_rejected"],
+                   help="send a payment.outcome event instead of a chargeback")
     p.add_argument("--raw", help="send this text as the message value instead of a valid event")
     p.add_argument("--bootstrap", default=os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
     args = p.parse_args()
@@ -68,6 +85,12 @@ def main() -> None:
         return
     if not args.transaction_id:
         p.error("transaction_id is required (or --raw)")
+    if args.outcome:
+        event = outcome(args.transaction_id, args.outcome, amount_minor=args.amount_minor, currency=args.currency,
+                        event_id=args.event_id)
+        produce(args.bootstrap, [event], topic=OUTCOME_TOPIC)
+        print(json.dumps(event))
+        return
     event = chargeback(args.transaction_id, amount_minor=args.amount_minor, currency=args.currency,
                        reason=args.reason, event_id=args.event_id)
     produce(args.bootstrap, [event])

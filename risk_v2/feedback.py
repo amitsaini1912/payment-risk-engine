@@ -3,12 +3,16 @@ Feedback loop (Portfolio Day 18, docs/adr/0005): chargebacks become labels on th
 
 Redis keeps a /v2 decision for 25 h (risk_v2/decisions.py); a chargeback arrives days or months later. So every new
 /v2 decision is also written here, to SQLite (FEEDBACK_DB_PATH), and the `chargeback.created` consumer
-(risk_v2/chargeback_consumer.py) adds the chargeback next to it:
+(risk_v2/feedback_consumer.py) adds the chargeback next to it:
 
   decisions    one row per transaction_id (first decision wins, like Redis): action, model score + versions, and
                the exact model_input - what scripts/retrain.py trains on
   chargebacks  one row per event_id: a redelivered event is stored once. The label is "the transaction has at least
                one chargeback" (a second dispute on the same payment doesn't make it more fraudulent)
+
+  payment_outcomes  (Day 19b, docs/adr/0006) one row per event_id from `payment.outcome`: billing says a payment was
+               captured (money moved: only then CAN it charge back) or a person approved / rejected a held one.
+               The honest label population is the CAPTURED payments - allowed ones and held-then-approved ones.
 
 A chargeback also feeds the engine's own `past_chargebacks` profile counter in Redis (until Day 18 it was always 0):
 counted once per TRANSACTION, atomically, so a redelivery or a second dispute on the same payment can't add 1 again.
@@ -43,6 +47,25 @@ DAY_MS = 86_400_000
 LABEL_WINDOW_DAYS = int(os.environ.get("FEEDBACK_LABEL_WINDOW_DAYS", "120"))
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "feedback.db")
 FLAGGED = ("hold_for_review", "block")
+
+
+class PaymentOutcomeEvent(BaseModel):
+    """docs/contracts/payment.outcome.v1.schema.json. Unknown fields are ignored (tolerant reader)."""
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    event_id: str = Field(min_length=1, max_length=64, pattern=ID)
+    transaction_id: str = Field(min_length=1, max_length=64, pattern=ID)
+    outcome: Literal["captured", "review_approved", "review_rejected"]
+    amount_minor: StrictInt = Field(gt=0, le=10**12)
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    occurred_at: AwareDatetime
+    schema_version: Literal[1]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_card_numbers(cls, values):
+        reject_pans(values)
+        return values
 
 
 class ChargebackEvent(BaseModel):
@@ -90,6 +113,17 @@ CREATE TABLE IF NOT EXISTS chargebacks (
     schema_version  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS chargebacks_by_txn ON chargebacks (transaction_id);
+CREATE TABLE IF NOT EXISTS payment_outcomes (
+    event_id        TEXT PRIMARY KEY,
+    transaction_id  TEXT NOT NULL,
+    outcome         TEXT NOT NULL,         -- captured | review_approved | review_rejected
+    amount_minor    INTEGER NOT NULL,
+    currency        TEXT NOT NULL,
+    occurred_at     TEXT NOT NULL,
+    received_at_ms  INTEGER NOT NULL,
+    schema_version  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS outcomes_by_txn ON payment_outcomes (transaction_id, outcome);
 """
 
 
@@ -142,6 +176,14 @@ class OutcomeStore:
              event.created_at.isoformat(), self.now_ms(), event.schema_version))
         return cur.rowcount == 1
 
+    def record_outcome(self, event: PaymentOutcomeEvent) -> bool:
+        """True = new event; False = this event_id was already stored (redelivery)."""
+        cur = self._conn().execute(
+            "INSERT OR IGNORE INTO payment_outcomes VALUES (?,?,?,?,?,?,?,?)",
+            (event.event_id, event.transaction_id, event.outcome, event.amount_minor, event.currency,
+             event.occurred_at.isoformat(), self.now_ms(), event.schema_version))
+        return cur.rowcount == 1
+
     # ---- reads ----
 
     def decision(self, transaction_id: str) -> Optional[dict]:
@@ -151,6 +193,11 @@ class OutcomeStore:
         out = dict(row)
         out["model_input"] = json.loads(out["model_input"])
         return out
+
+    def outcomes(self, transaction_id: str) -> list[dict]:
+        rows = self._conn().execute("SELECT * FROM payment_outcomes WHERE transaction_id = ? ORDER BY received_at_ms",
+                                    (transaction_id,)).fetchall()
+        return [dict(r) for r in rows]
 
     def chargebacks(self, transaction_id: str) -> list[dict]:
         rows = self._conn().execute("SELECT * FROM chargebacks WHERE transaction_id = ? ORDER BY received_at_ms",
@@ -162,8 +209,10 @@ class OutcomeStore:
         """Precision/recall per decision-date bucket (UTC), from the chargebacks received so far.
 
         Final action: flagged = hold_for_review or block. Model band: flagged = score >= its threshold (rows the
-        model could not score are left out). Both numbers are LOWER BOUNDS: a blocked fraud is never captured, so
-        it never charges back - it counts as a false positive and is missing from recall's true positives.
+        model could not score are left out). Over ALL decisions both are LOWER BOUNDS: a blocked fraud is never
+        captured, so it never charges back - it counts as a false positive and is missing from recall's true positives.
+        `captured` (Day 19b) = the same numbers over CAPTURED payments only (billing's payment.outcome): every row
+        there could charge back, so its labels are real. Flagged-and-captured = held, approved by a person, captured.
         A bucket is `mature` once all its payments are older than the label window; before that, chargebacks are
         still arriving and recall looks better than it is.
         """
@@ -185,9 +234,22 @@ class OutcomeStore:
                    SUM(IFNULL(model_score >= threshold, 0)) AS m_flagged,
                    SUM(IFNULL(model_score >= threshold AND cb, 0)) AS m_tp,
                    SUM(IFNULL(model_score < threshold AND cb, 0)) AS m_fn,
+                   SUM(cap) AS captured, SUM(appr) AS approved, SUM(rej) AS rejected,
+                   SUM(cap AND action IN ('hold_for_review', 'block')) AS c_flagged,
+                   SUM(cap AND action IN ('hold_for_review', 'block') AND cb) AS c_tp,
+                   SUM(cap AND action = 'allow' AND cb) AS c_fn,
+                   SUM(IFNULL(cap AND model_score >= threshold, 0)) AS cm_flagged,
+                   SUM(IFNULL(cap AND model_score >= threshold AND cb, 0)) AS cm_tp,
+                   SUM(IFNULL(cap AND model_score < threshold AND cb, 0)) AS cm_fn,
                    GROUP_CONCAT(DISTINCT model_version) AS versions
             FROM (SELECT d.*, d.decided_at_ms / {bucket_ms} AS b,
-                         EXISTS (SELECT 1 FROM chargebacks c WHERE c.transaction_id = d.transaction_id) AS cb
+                         EXISTS (SELECT 1 FROM chargebacks c WHERE c.transaction_id = d.transaction_id) AS cb,
+                         EXISTS (SELECT 1 FROM payment_outcomes o WHERE o.transaction_id = d.transaction_id
+                                 AND o.outcome = 'captured') AS cap,
+                         EXISTS (SELECT 1 FROM payment_outcomes o WHERE o.transaction_id = d.transaction_id
+                                 AND o.outcome = 'review_approved') AS appr,
+                         EXISTS (SELECT 1 FROM payment_outcomes o WHERE o.transaction_id = d.transaction_id
+                                 AND o.outcome = 'review_rejected') AS rej
                   FROM decisions d WHERE {where})
             GROUP BY b ORDER BY b""", args).fetchall()
 
@@ -210,6 +272,14 @@ class OutcomeStore:
                           "fp": r["m_flagged"] - r["m_tp"], "fn": r["m_fn"],
                           "precision": ratio(r["m_tp"], r["m_flagged"]),
                           "recall": ratio(r["m_tp"], r["m_tp"] + r["m_fn"])},
+                "outcomes": {"captured": r["captured"], "review_approved": r["approved"],
+                             "review_rejected": r["rejected"]},
+                "captured": {"final": {"flagged": r["c_flagged"], "tp": r["c_tp"], "fp": r["c_flagged"] - r["c_tp"],
+                                       "fn": r["c_fn"], "precision": ratio(r["c_tp"], r["c_flagged"]),
+                                       "recall": ratio(r["c_tp"], r["c_tp"] + r["c_fn"])},
+                             "model": {"flagged": r["cm_flagged"], "tp": r["cm_tp"], "fp": r["cm_flagged"] - r["cm_tp"],
+                                       "fn": r["cm_fn"], "precision": ratio(r["cm_tp"], r["cm_flagged"]),
+                                       "recall": ratio(r["cm_tp"], r["cm_tp"] + r["cm_fn"])}},
             })
         unmatched = self._conn().execute("""
             SELECT COUNT(DISTINCT transaction_id) FROM chargebacks c
@@ -218,22 +288,31 @@ class OutcomeStore:
             "bucket": bucket, "since": _iso(since), "model_version": model_version,
             "label_window_days": label_window_days, "buckets": buckets,
             "unmatched_chargebacks": unmatched,   # chargebacks for payments this engine has no /v2 decision for
-            "note": "precision and recall are lower bounds: blocked payments are never captured, so they can't "
-                    "charge back (docs/adr/0005)",
+            "note": "final/model over all decisions are lower bounds: blocked payments are never captured, so they "
+                    "can't charge back (docs/adr/0005). `captured` counts only payments billing reported captured "
+                    "(docs/adr/0006): real labels, still blind to what was blocked or rejected",
         }
 
-    def labeled_decisions(self, *, decided_before_ms: int, actions: tuple[str, ...] = ("allow",)) -> list[dict]:
+    def labeled_decisions(self, *, decided_before_ms: int,
+                          population: Literal["captured", "allow"] = "captured") -> list[dict]:
         """Matured decisions with their label, oldest first: model_input + is_chargeback + decided_at_ms.
 
-        Only `allow` by default: held/blocked payments are labeled by what WE did to them (a blocked fraud never
-        charges back), so training on them as 'no chargeback' would teach the model that what we block is safe.
+        captured (default, Day 19b): payments billing reported CAPTURED - allowed ones and held-then-approved ones.
+          Only those could charge back, so "no chargeback" is a real label.
+        allow (Day 18, when billing sends no outcomes): final action allow, assumed captured.
+        Never blocked or rejected payments: they are labeled by what WE did to them (a blocked fraud never charges
+        back), so as 'no chargeback' rows they would teach the model that what we stop is safe.
         """
-        marks = ",".join("?" * len(actions))
+        population_sql = {
+            "captured": "EXISTS (SELECT 1 FROM payment_outcomes o WHERE o.transaction_id = d.transaction_id "
+                        "AND o.outcome = 'captured')",
+            "allow": "d.action = 'allow'",
+        }[population]
         rows = self._conn().execute(f"""
             SELECT d.model_input, d.decided_at_ms, d.action,
                    EXISTS (SELECT 1 FROM chargebacks c WHERE c.transaction_id = d.transaction_id) AS cb
-            FROM decisions d WHERE d.decided_at_ms < ? AND d.action IN ({marks})
-            ORDER BY d.decided_at_ms, d.transaction_id""", (decided_before_ms, *actions)).fetchall()
+            FROM decisions d WHERE d.decided_at_ms < ? AND {population_sql}
+            ORDER BY d.decided_at_ms, d.transaction_id""", (decided_before_ms,)).fetchall()
         return [{**json.loads(r["model_input"]), "is_chargeback": int(r["cb"]), "decided_at_ms": r["decided_at_ms"],
                  "action": r["action"]} for r in rows]
 
@@ -262,7 +341,7 @@ class Applied:
 
 
 class FeedbackLoop:
-    """One chargeback event -> label + profile counter. Raises sqlite3.Error / redis.RedisError on trouble: the
+    """One chargeback event -> label + profile counter; one payment.outcome event -> stored next to the decision. Raises sqlite3.Error / redis.RedisError on trouble: the
     consumer then does NOT commit the offset and tries again (both steps are safe to repeat)."""
 
     def __init__(self, outcomes: OutcomeStore, client: redis.Redis):
@@ -280,3 +359,9 @@ class FeedbackLoop:
         count = self._count(keys=[f"{cust}:chargeback_txns", f"{cust}:profile"],
                             args=[event.transaction_id, KEEP_PROFILE_S])
         return Applied("stored" if new else "duplicate", int(count))
+
+    def apply_outcome(self, event: PaymentOutcomeEvent) -> Applied:
+        new = self.outcomes.record_outcome(event)
+        if self.outcomes.decision(event.transaction_id) is None:
+            return Applied("unmatched", None)   # e.g. billing's fallback decided it: the engine never saw it
+        return Applied("stored" if new else "duplicate", None)

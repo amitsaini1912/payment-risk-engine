@@ -14,7 +14,7 @@ FastAPI service exposing the risk agent.
   GET  /feedback/{txn_id}     a /v2 decision with its chargebacks (the label)
 
 /assess, /v2/assess, /audit, /governance and /feedback need `X-API-Key` (RISK_API_KEYS, risk_v2/auth.py).
-KAFKA_ENABLED=true also starts the `chargeback.created` consumer (risk_v2/chargeback_consumer.py).
+KAFKA_ENABLED=true also starts the feedback consumer: chargeback.created + payment.outcome (risk_v2/feedback_consumer.py).
 
 Run:
   uvicorn api.main:app --reload --port 8000     # from the repo root
@@ -57,7 +57,7 @@ from risk_v2.auth import ApiKeys, AuthNotConfigured  # noqa: E402
 from risk_v2.budget import Deadline  # noqa: E402
 from risk_v2.contract import AssessV2Request  # noqa: E402
 from risk_v2.decision import decide  # noqa: E402
-from risk_v2.chargeback_consumer import ChargebackConsumer  # noqa: E402
+from risk_v2.feedback_consumer import FeedbackConsumer  # noqa: E402
 from risk_v2.decisions import DecisionConflict, DecisionStore, request_hash  # noqa: E402
 from risk_v2.feedback import DAY_MS, LABEL_WINDOW_DAYS, FeedbackLoop, OutcomeStore  # noqa: E402
 from risk_v2.governance import Governance  # noqa: E402
@@ -68,7 +68,7 @@ from scorer import load_scorer, load_shadow  # noqa: E402
 
 install_log_masking()   # every log line, incl. uvicorn's access log: PANs/emails masked (Day 17)
 log = logging.getLogger(__name__)
-_consumer: Optional[ChargebackConsumer] = None
+_consumer: Optional[FeedbackConsumer] = None
 
 
 @asynccontextmanager
@@ -82,7 +82,7 @@ async def lifespan(_app: FastAPI):
     global _consumer
     outcomes = get_outcome_store()
     if os.environ.get("KAFKA_ENABLED", "false").lower() == "true" and outcomes is not None:
-        _consumer = ChargebackConsumer.from_env(FeedbackLoop(outcomes, get_feature_store().client))
+        _consumer = FeedbackConsumer.from_env(FeedbackLoop(outcomes, get_feature_store().client))
         _consumer.start()
     yield
     if _consumer is not None:

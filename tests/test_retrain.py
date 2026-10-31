@@ -30,16 +30,20 @@ def data():
     return pd.read_csv(DATA)
 
 
-def fill(path: str, rows: pd.DataFrame, *, age_days: float, action: str = "allow") -> OutcomeStore:
-    """Each row becomes a /v2 decision `age_days` old (one ms apart) and, if is_chargeback, gets a chargeback."""
+def fill(path: str, rows: pd.DataFrame, *, age_days: float, action: str = "allow", captured: bool = True) -> OutcomeStore:
+    """Each row becomes a /v2 decision `age_days` old (one ms apart), billing's `captured` outcome if `captured`, and,
+    if is_chargeback, a chargeback."""
     store = OutcomeStore(path, clock=lambda: NOW)
     start = int(NOW * 1000 - age_days * DAY_MS)
     for i, row in enumerate(rows.to_dict("records")):
-        txn = f"live-{action}-{i}"
+        txn = f"live-{action}-{'c' if captured else 'n'}-{int(age_days)}-{i}"
         model_input = {k: row[k] for k in REQUIRED_RAW_FIELDS} | {"transaction_id": txn, "customer_id": "c"}
         store.record_decision({"transaction_id": txn, "action": action, "model_score": 0.1, "threshold": 0.4,
                                "model_version": "old", "rules_version": "r1", "model_input": model_input,
                                "signals": {"observed_at_ms": start + i}})
+        if captured:
+            store._conn().execute("INSERT INTO payment_outcomes VALUES (?,?,?,?,?,?,?,?)",
+                                  (f"out-{txn}", txn, "captured", 100, "INR", "2026-01-01T00:00:00+00:00", 0, 1))
         if row["is_chargeback"]:
             store._conn().execute("INSERT INTO chargebacks VALUES (?,?,?,?,?,?,?,?)",
                                   (f"evt-{txn}", txn, 100, "INR", "fraud", "2026-01-01T00:00:00+00:00", 0, 1))
@@ -56,7 +60,8 @@ def test_retrain_writes_a_candidate_and_compares_it_on_the_newest_labels(data, t
     data.iloc[:4000].to_csv(tmp_path / "base.csv", index=False)
     live = data.iloc[4000:5000]
     fill(str(tmp_path / "feedback.db"), live, age_days=200)
-    fill(str(tmp_path / "feedback.db"), data.iloc[5000:5300], age_days=200, action="block")   # never trained on
+    fill(str(tmp_path / "feedback.db"), data.iloc[5000:5300], age_days=200, action="block", captured=False)  # never trained on
+    fill(str(tmp_path / "feedback.db"), data.iloc[6000:6200], age_days=200, captured=False)   # allowed, not captured
     fill(str(tmp_path / "feedback.db"), data.iloc[5300:5600], age_days=30)                    # not labeled yet
     champion_mtime = os.path.getmtime(CHAMPION)
 
@@ -103,3 +108,11 @@ def test_a_holdout_without_chargebacks_is_refused_before_training(data, tmp_path
 
 def test_no_feedback_store_is_exit_2_not_a_crash(tmp_path):
     assert run(tmp_path) == 2
+
+
+def test_population_allow_is_the_day_18_behaviour_without_outcomes(data, tmp_path):
+    data.iloc[:500].to_csv(tmp_path / "base.csv", index=False)
+    fill(str(tmp_path / "feedback.db"), data.iloc[500:900], age_days=200, captured=False)   # billing sent no outcomes
+    args = ("--min-labeled", "100", "--min-chargebacks", "1", "--min-holdout-chargebacks", "1")
+    assert run(tmp_path, *args) == 2                                                    # captured: nothing labeled
+    assert run(tmp_path, *args, "--population", "allow") == 0

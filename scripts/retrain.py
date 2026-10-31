@@ -6,8 +6,10 @@ Retrain from labeled /v2 decisions (Portfolio Day 18, docs/adr/0005). Writes a C
 
 1. Labeled data = /v2 decisions in the feedback store (FEEDBACK_DB_PATH) that are
    - older than the label window (FEEDBACK_LABEL_WINDOW_DAYS, 120): before that "no chargeback" isn't known yet;
-   - final action `allow`: a blocked payment is never captured, so it can't charge back - as a "no chargeback"
-     row it would teach the model that what the engine blocks is safe (the loop would erase its own knowledge).
+   - --population captured (default, Day 19b): billing reported the payment CAPTURED (payment.outcome) - allowed
+     ones and held-then-approved ones. --population allow (Day 18 behaviour, billing sends no outcomes): final
+     action allow. Never blocked / rejected payments: they can't charge back, so as "no chargeback" rows they
+     would teach the model that what the engine stops is safe (the loop would erase its own knowledge).
    Label = the payment has at least one chargeback.
 2. The newest --holdout share (by decision time) is kept out of training: it is the "future" both models are
    compared on.
@@ -69,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--champion", default=os.environ.get("MODEL_PATH", train.MODEL_PATH))
     p.add_argument("--out", default="model/candidate")
     p.add_argument("--label-window-days", type=int, default=LABEL_WINDOW_DAYS)
+    p.add_argument("--population", choices=["captured", "allow"], default="captured")
     p.add_argument("--holdout", type=float, default=0.2)
     p.add_argument("--min-labeled", type=int, default=200)
     p.add_argument("--min-chargebacks", type=int, default=10)
@@ -80,9 +83,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no feedback store at {args.db} - nothing to retrain from")
         return 2
     store = OutcomeStore(args.db)
-    rows = store.labeled_decisions(decided_before_ms=store.now_ms() - args.label_window_days * DAY_MS)
+    rows = store.labeled_decisions(decided_before_ms=store.now_ms() - args.label_window_days * DAY_MS,
+                                   population=args.population)
     positives = sum(r["is_chargeback"] for r in rows)
-    print(f"labeled decisions (allow, older than {args.label_window_days} days): {len(rows)}, "
+    print(f"labeled decisions ({args.population}, older than {args.label_window_days} days): {len(rows)}, "
           f"with chargeback: {positives}")
     if len(rows) < args.min_labeled or positives < args.min_chargebacks:
         print(f"not enough labeled data (need >= {args.min_labeled} decisions and >= {args.min_chargebacks} "
@@ -117,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         "holdout": {"rows": len(holdout), "chargebacks": int(holdout["is_chargeback"].sum()),
                     "from_ms": int(holdout["decided_at_ms"].iloc[0]), "to_ms": int(holdout["decided_at_ms"].iloc[-1])},
         "training": {"live_rows": len(live_train), "synthetic_rows": len(data) - len(live_train)},
-        "label_window_days": args.label_window_days,
+        "label_window_days": args.label_window_days, "population": args.population,
         "champion": evaluate(joblib.load(args.champion), holdout) if os.path.exists(args.champion) else None,
         "candidate": evaluate(joblib.load(out["model.pkl"]), holdout),
     }

@@ -13,7 +13,7 @@ import pytest
 import redis
 from prometheus_client import REGISTRY
 
-from risk_v2.feedback import DAY_MS, ChargebackEvent, FeedbackLoop
+from risk_v2.feedback import DAY_MS, ChargebackEvent, FeedbackLoop, PaymentOutcomeEvent
 from v2_support import facts
 
 _events = iter(range(1, 10**9))
@@ -24,6 +24,13 @@ def chargeback(txn: str, **overrides) -> ChargebackEvent:
             "currency": "INR", "reason": "fraud", "created_at": "2026-11-20T10:15:00+05:30", "schema_version": 1}
     body.update(overrides)
     return ChargebackEvent.model_validate(body)
+
+
+def outcome(txn: str, kind: str = "captured", **overrides) -> PaymentOutcomeEvent:
+    body = {"event_id": f"evt-{next(_events)}", "transaction_id": txn, "outcome": kind, "amount_minor": 150_000,
+            "currency": "INR", "occurred_at": "2026-10-31T05:38:02.376Z", "schema_version": 1}
+    body.update(overrides)
+    return PaymentOutcomeEvent.model_validate(body)
 
 
 def decision(txn: str, action: str, *, score=0.2, threshold=0.4, at_ms: int, version="m1", customer="cust-1") -> dict:
@@ -187,7 +194,7 @@ def test_labeled_decisions_are_matured_allows_only(outcomes):
                                   ("b1", "block", 200), ("young", "allow", 10)]:
         outcomes.record_decision(decision(txn, action, at_ms=now - age_days * DAY_MS))
     outcomes.record_chargeback(chargeback("a2"))
-    rows = outcomes.labeled_decisions(decided_before_ms=now - 120 * DAY_MS)
+    rows = outcomes.labeled_decisions(decided_before_ms=now - 120 * DAY_MS, population="allow")
     assert [(r["transaction_id"], r["is_chargeback"]) for r in rows] == [("a1", 0), ("a2", 1)]   # oldest first
     assert rows[0]["amount"] == 1500.0 and rows[0]["action"] == "allow"
 
@@ -223,3 +230,67 @@ def test_feedback_endpoints_need_a_key(v2_client):
     client = TestClient(app)
     assert client.get("/feedback/performance").status_code == 401
     assert client.get("/feedback/pay-1").status_code == 401
+
+
+# ---- Day 19b: payment outcomes from billing ----
+
+def test_outcomes_are_stored_once_and_unknown_payments_are_unmatched(v2_client, outcomes, redis_client):
+    txn = v2_client.post("/v2/assess", json=facts()).json()["transaction_id"]
+    loop = FeedbackLoop(outcomes, redis_client)
+    event = outcome(txn)
+    assert loop.apply_outcome(event).outcome == "stored"
+    assert loop.apply_outcome(event).outcome == "duplicate"
+    assert loop.apply_outcome(outcome("pay-decided-by-billing-fallback")).outcome == "unmatched"
+    assert [o["outcome"] for o in outcomes.outcomes(txn)] == ["captured"]
+
+
+@pytest.mark.parametrize("change", [{"outcome": "settled"}, {"outcome": "Captured"}, {"amount_minor": 0},
+                                    {"schema_version": 2}, {"occurred_at": "2026-10-31T05:38:02"},
+                                    {"transaction_id": "4111111111111111"}])
+def test_outcomes_outside_the_contract_are_rejected(change):
+    with pytest.raises(ValueError):
+        outcome("pay-1", **change)
+
+
+def test_labeled_population_is_captured_payments(outcomes):
+    now = outcomes.now_ms()
+    old = now - 200 * DAY_MS
+    for i, (txn, action) in enumerate([("allow-captured", "allow"), ("allow-never-captured", "allow"),
+                                       ("held-approved", "hold_for_review"), ("held-rejected", "hold_for_review"),
+                                       ("blocked", "block")]):
+        outcomes.record_decision(decision(txn, action, at_ms=old + i))
+    for txn, kind in [("allow-captured", "captured"), ("held-approved", "review_approved"),
+                      ("held-approved", "captured"), ("held-rejected", "review_rejected")]:
+        outcomes.record_outcome(outcome(txn, kind))
+    outcomes.record_chargeback(chargeback("held-approved"))
+
+    rows = outcomes.labeled_decisions(decided_before_ms=now - 120 * DAY_MS)            # default: captured
+    assert [(r["transaction_id"], r["is_chargeback"]) for r in rows] == [("allow-captured", 0), ("held-approved", 1)]
+
+
+def test_precision_and_recall_over_captured_payments(outcomes):
+    now = outcomes.now_ms()
+    day = now // DAY_MS * DAY_MS
+    rows = [  # txn, action, score (thr 0.4), outcomes, chargeback?
+        ("a", "allow", 0.1, ["captured"], True),                  # missed fraud (fn)
+        ("b", "allow", 0.1, ["captured"], False),
+        ("c", "allow", 0.5, [], False),                           # never captured: no label in `captured`
+        ("d", "hold_for_review", 0.6, ["review_approved", "captured"], True),   # reviewer let a fraud through (tp)
+        ("e", "hold_for_review", 0.7, ["review_approved", "captured"], False),  # held, was fine (fp)
+        ("f", "hold_for_review", 0.8, ["review_rejected"], False),
+        ("g", "block", 0.9, [], False),
+    ]
+    for i, (txn, action, score, kinds, cb) in enumerate(rows):
+        outcomes.record_decision(decision(txn, action, score=score, at_ms=day + i))
+        for kind in kinds:
+            outcomes.record_outcome(outcome(txn, kind))
+        if cb:
+            outcomes.record_chargeback(chargeback(txn))
+    b = outcomes.performance(days=1)["buckets"][0]
+
+    assert b["outcomes"] == {"captured": 4, "review_approved": 2, "review_rejected": 1}
+    assert b["captured"]["final"] == {"flagged": 2, "tp": 1, "fp": 1, "fn": 1, "precision": 0.5, "recall": 0.5}
+    assert b["captured"]["model"] == {"flagged": 2, "tp": 1, "fp": 1, "fn": 1, "precision": 0.5, "recall": 0.5}
+    # over all decisions the blocked + rejected + uncaptured rows count as false positives: lower bounds
+    assert b["final"]["flagged"] == 4 and b["final"]["precision"] == 0.25          # 3 holds + 1 block, 1 tp
+    assert b["model"]["flagged"] == 5 and b["model"]["precision"] == 0.2           # c, d, e, f, g >= 0.4
