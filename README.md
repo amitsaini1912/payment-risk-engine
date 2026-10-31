@@ -140,7 +140,7 @@ with coverage on every push.
 - **Control of signal.** The generator plants known fraud patterns, so we can
   verify the model learns real structure rather than an artefact.
 - **No licensing / PII risk** from real payment data.
-- **Tunable imbalance.** We target a realistic 2–8% chargeback rate (~6% here).
+- **Tunable imbalance.** We target a realistic 2–8% chargeback rate (5.5% here).
 
 The label is never a coin flip. For each transaction the generator builds a
 "true" chargeback probability = small base rate × pattern multipliers, with some
@@ -150,15 +150,17 @@ observed chargeback lift.
 
 ### Hand-crafted fraud patterns
 
-| ID | Pattern | Intuition | Observed lift |
-|----|---------|-----------|---------------|
-| P1 | New account (≤30d) + high amount (≥₹15k) + odd hour | Stolen card, cash out fast | ~8× |
-| P2 | Customer has prior chargebacks | Recidivism / compromised account | ~4× |
-| P3 | ≥6 tiny transactions in the last hour | Card-number testing | ~5× |
-| P4 | IP country ≠ billing country, or new device on a high-value buy | Account takeover | ~4× |
-| P5 | Prepaid or international card + high amount | Anonymous / hard-to-recover instrument | ~8× |
-| P6 | Amount ≫ customer's average order value | Spend spike after takeover | ~5× |
-| P7 | Disposable email domain | Throwaway identity | ~2× |
+| ID | Pattern | Intuition | Payments | Chargeback rate | Lift |
+|----|---------|-----------|---|---|---|
+| P1 | New account (≤30d) + high amount (≥₹15k) + odd hour | Stolen card, cash out fast | 70 | 48.6% | 8.8× |
+| P2 | Customer has prior chargebacks | Recidivism / compromised account | 1,188 | 25.4% | 4.6× |
+| P3 | ≥6 tiny transactions in the last hour | Card-number testing | 118 | 50.0% | 9.0× |
+| P4 | IP country ≠ billing country, or new device on a high-value buy | Account takeover | 719 | 28.0% | 5.1× |
+| P5 | Prepaid or international card + high amount | Anonymous / hard-to-recover instrument | 111 | 57.7% | 10.4× |
+| P6 | Amount ≫ customer's average order value | Spend spike after takeover | 739 | 34.0% | 6.1× |
+| P7 | Disposable email domain | Throwaway identity | 432 | 14.4% | 2.6× |
+
+Measured on the shipped dataset (`--rows 15000 --seed 42`, 5.53% chargebacks); the generator prints this table.
 
 ### Regenerate
 
