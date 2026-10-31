@@ -8,6 +8,9 @@ venv/
 .pytest_cache/
 logs/
 data/transactions.csv
+data/feedback.db*
+model/candidate/
+scripts/
 model/model.pkl
 model/shadow.pkl
 tests/

@@ -10,8 +10,11 @@ FastAPI service exposing the risk agent.
   GET  /metrics/prometheus  service metrics for Prometheus (latency histogram, decisions, 503s, ...)
   GET  /health              liveness
   GET  /ready               readiness: API keys, rules, model and Redis all usable
+  GET  /feedback/performance  precision/recall over time from chargebacks (Day 18, docs/adr/0005)
+  GET  /feedback/{txn_id}     a /v2 decision with its chargebacks (the label)
 
-/assess, /v2/assess and /audit need `X-API-Key` (RISK_API_KEYS, risk_v2/auth.py).
+/assess, /v2/assess, /audit, /governance and /feedback need `X-API-Key` (RISK_API_KEYS, risk_v2/auth.py).
+KAFKA_ENABLED=true also starts the `chargeback.created` consumer (risk_v2/chargeback_consumer.py).
 
 Run:
   uvicorn api.main:app --reload --port 8000     # from the repo root
@@ -20,15 +23,17 @@ Run:
 from __future__ import annotations
 
 import json
+import logging
 import os
+import sqlite3
 import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
 from functools import lru_cache
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -52,7 +57,9 @@ from risk_v2.auth import ApiKeys, AuthNotConfigured  # noqa: E402
 from risk_v2.budget import Deadline  # noqa: E402
 from risk_v2.contract import AssessV2Request  # noqa: E402
 from risk_v2.decision import decide  # noqa: E402
+from risk_v2.chargeback_consumer import ChargebackConsumer  # noqa: E402
 from risk_v2.decisions import DecisionConflict, DecisionStore, request_hash  # noqa: E402
+from risk_v2.feedback import DAY_MS, LABEL_WINDOW_DAYS, FeedbackLoop, OutcomeStore  # noqa: E402
 from risk_v2.governance import Governance  # noqa: E402
 from risk_v2.rules import RuleBook, RuleLoader, RulesUnavailable  # noqa: E402
 from risk_v2.store import FeatureStore, FeaturesUnavailable  # noqa: E402
@@ -60,6 +67,8 @@ from scorer import load_scorer, load_shadow  # noqa: E402
 
 
 install_log_masking()   # every log line, incl. uvicorn's access log: PANs/emails masked (Day 17)
+log = logging.getLogger(__name__)
+_consumer: Optional[ChargebackConsumer] = None
 
 
 @asynccontextmanager
@@ -70,7 +79,15 @@ async def lifespan(_app: FastAPI):
             warm()
         except Exception as exc:  # noqa: BLE001 - /ready reports it; the process still starts
             print(f"[startup] warm-up {getattr(warm, '__name__', warm)} failed: {exc}")
+    global _consumer
+    outcomes = get_outcome_store()
+    if os.environ.get("KAFKA_ENABLED", "false").lower() == "true" and outcomes is not None:
+        _consumer = ChargebackConsumer.from_env(FeedbackLoop(outcomes, get_feature_store().client))
+        _consumer.start()
     yield
+    if _consumer is not None:
+        _consumer.stop()
+        _consumer = None
 
 
 app = FastAPI(
@@ -200,6 +217,7 @@ def health(loader: RuleLoader = Depends(get_rule_loader)) -> dict:
         "llm_model": DEFAULT_MODEL if is_configured() else None,
         "rules_version": rules_version,   # the version /v2 decisions use right now
         "rules_error": loader.last_error,  # why the newest rules.yaml was rejected (the old version keeps running)
+        "feedback_consumer": _consumer.status() if _consumer else None,   # KAFKA_ENABLED=false -> null
     }
 
 
@@ -288,6 +306,22 @@ def get_governance(store: FeatureStore = Depends(get_feature_store)) -> Governan
     return Governance(store.client)
 
 
+_outcome_store: Optional[OutcomeStore] = None
+
+
+def get_outcome_store() -> Optional[OutcomeStore]:
+    """Decisions + chargebacks for the feedback loop (FEEDBACK_DB_PATH). None if the file can't be opened: /v2
+    decisions go on without it (counted in risk_feedback_write_failures_total). Tests override this."""
+    global _outcome_store
+    if _outcome_store is None:
+        try:
+            _outcome_store = OutcomeStore.from_env()
+        except (sqlite3.Error, OSError) as exc:
+            log.warning("feedback store unavailable: %s", exc)
+            return None
+    return _outcome_store
+
+
 def get_explainer() -> Optional[Callable[[str], str]]:
     """The LLM call for explanations; None = Gemini if a key is set, else the template. Tests override this."""
     return None
@@ -312,6 +346,7 @@ def assess_v2(req: AssessV2Request, caller: str = Depends(require_caller),
               decisions: DecisionStore = Depends(get_decision_store),
               book: RuleBook = Depends(get_rulebook),
               governance: Governance = Depends(get_governance),
+              outcomes: Optional[OutcomeStore] = Depends(get_outcome_store),
               explainer: Optional[Callable[[str], str]] = Depends(get_explainer)) -> dict:
     """Billing sends facts; every risk feature is computed here (weakness #14). Old /assess is unchanged.
 
@@ -357,6 +392,7 @@ def assess_v2(req: AssessV2Request, caller: str = Depends(require_caller),
         return {**kept, "replayed": True}
 
     write_entry({**decision, "caller": caller})
+    _keep_for_feedback(outcomes, decision)
     if decision["model_score"] is not None:
         governance.record(decision, model_input, load_scorer().drift_reference)
     m.DECISIONS.labels("v2", decision["action"], decision["path_used"]).inc()
@@ -367,6 +403,17 @@ def assess_v2(req: AssessV2Request, caller: str = Depends(require_caller),
     if decision["decided_in_ms"] > deadline.budget_s * 1000:
         m.BUDGET_EXCEEDED.inc()
     return decision
+
+
+def _keep_for_feedback(outcomes: Optional[OutcomeStore], decision: dict) -> None:
+    """Like the audit trail: a failure here must not change or fail the decision (it only loses a future label)."""
+    try:
+        if outcomes is None:
+            raise sqlite3.OperationalError("feedback store not available")
+        outcomes.record_decision(decision)
+    except sqlite3.Error as exc:
+        m.FEEDBACK_WRITE_FAILURES.inc()
+        log.warning("decision %s not kept for the feedback loop: %s", decision["transaction_id"], exc)
 
 
 @app.get("/audit/{transaction_id}")
@@ -432,3 +479,32 @@ def prometheus_metrics(governance: Governance = Depends(get_governance)) -> Resp
     except Exception:  # noqa: BLE001 - Redis or model trouble shows in /ready; metrics still served
         pass
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+def _require_outcomes(outcomes: Optional[OutcomeStore] = Depends(get_outcome_store)) -> OutcomeStore:
+    if outcomes is None:
+        raise HTTPException(status_code=503, detail="feedback store unavailable")
+    return outcomes
+
+
+@app.get("/feedback/performance")
+def feedback_performance(bucket: Literal["day", "week"] = "day", days: int = Query(default=30, ge=1, le=730),
+                         model_version: Optional[str] = Query(default=None, max_length=64),
+                         _caller: str = Depends(require_caller),
+                         outcomes: OutcomeStore = Depends(_require_outcomes)) -> dict:
+    """Precision/recall of /v2 decisions per day or week, from the chargebacks received so far (docs/adr/0005).
+    Lower bounds (blocked payments can't charge back); buckets younger than the label window are not `mature`."""
+    return outcomes.performance(bucket=bucket, days=days, model_version=model_version)
+
+
+@app.get("/feedback/{transaction_id}")
+def feedback_for(transaction_id: str, _caller: str = Depends(require_caller),
+                 outcomes: OutcomeStore = Depends(_require_outcomes)) -> dict:
+    decision, chargebacks = outcomes.decision(transaction_id), outcomes.chargebacks(transaction_id)
+    if decision is None and not chargebacks:
+        raise HTTPException(status_code=404, detail=f"no decision or chargeback for {mask(transaction_id)}")
+    if chargebacks:
+        label = 1
+    else:   # "no chargeback" is only a label once the payment is older than the window chargebacks can arrive in
+        label = 0 if decision["decided_at_ms"] + LABEL_WINDOW_DAYS * DAY_MS <= outcomes.now_ms() else None
+    return {"transaction_id": transaction_id, "decision": decision, "chargebacks": chargebacks, "label": label}

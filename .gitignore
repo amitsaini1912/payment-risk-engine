@@ -20,6 +20,10 @@ model/shadow.pkl
 # --- Runtime logs (sample entry shown in README) ---
 logs/*.jsonl
 
+# --- Feedback loop (Day 18): decisions + chargebacks, and retrain candidates (scripts/retrain.py) ---
+data/feedback.db*
+model/candidate/
+
 # --- OS / editor ---
 .DS_Store
 .idea/

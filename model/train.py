@@ -155,13 +155,16 @@ def at_threshold(y_true, scores, amounts, t: float) -> dict:
     }
 
 
-def main() -> None:
-    if not os.path.exists(DATA_PATH):
-        sys.exit(f"missing {DATA_PATH} - run: python data/generate_data.py")
+def main(data_path: str = DATA_PATH, model_path: str = MODEL_PATH, shadow_path: str = SHADOW_PATH,
+         metrics_path: str = METRICS_PATH, plot_path: str = PLOT_PATH) -> dict:
+    """Train on `data_path`, write the bundles + metrics. scripts/retrain.py (Day 18) calls this with its own data
+    and a candidate folder, so a retrain never overwrites the live model. Returns the metrics."""
+    if not os.path.exists(data_path):
+        sys.exit(f"missing {data_path} - run: python data/generate_data.py")
 
-    with open(DATA_PATH, "rb") as fh:
+    with open(data_path, "rb") as fh:
         data_bytes = fh.read()
-    df = pd.read_csv(DATA_PATH)
+    df = pd.read_csv(data_path)
     rest_df, test_df = train_test_split(df, test_size=0.2, random_state=RANDOM_STATE, stratify=df["is_chargeback"])
     train_df, val_df = train_test_split(rest_df, test_size=0.25, random_state=RANDOM_STATE,
                                         stratify=rest_df["is_chargeback"])      # 0.25 x 0.8 = 20% of all
@@ -208,7 +211,7 @@ def main() -> None:
 
     champ = bundles["champion"]
     print_report(champ["_thr"], champ["_thr_unconstrained"], champ["_curve"])
-    save_plot(champ["_curve"], champ["threshold"], PLOT_PATH, champ["_thr_unconstrained"].threshold)
+    save_plot(champ["_curve"], champ["threshold"], plot_path, champ["_thr_unconstrained"].threshold)
     thr, thr_u, test = champ["_thr"], champ["_thr_unconstrained"], champ["metrics"]
     selected_metrics = {
         "threshold": champ["threshold"],
@@ -249,10 +252,10 @@ def main() -> None:
                    "threshold": bundles["shadow"]["threshold"], "test": bundles["shadow"]["metrics"]},
         "top_feature_importances": top_feature_importances(champ["pipeline"], X_test, y_test),
     }
-    with open(METRICS_PATH, "w") as fh:
+    with open(metrics_path, "w") as fh:
         json.dump(metrics, fh, indent=2)
-    print(f"\nwrote {METRICS_PATH}")
-    for role, path in (("champion", MODEL_PATH), ("shadow", SHADOW_PATH)):
+    print(f"\nwrote {metrics_path}")
+    for role, path in (("champion", model_path), ("shadow", shadow_path)):
         joblib.dump({k: v for k, v in bundles[role].items() if not k.startswith("_")}, path)
         print(f"wrote {path} ({role})")
 
@@ -260,6 +263,7 @@ def main() -> None:
         print("\nWARNING: test recall below the 0.75 acceptance bar - iterate on the model.")
     else:
         print(f"\ntest recall {test['recall']:.3f} meets the >=0.75 bar at precision {test['precision']:.3f}")
+    return metrics
 
 
 if __name__ == "__main__":

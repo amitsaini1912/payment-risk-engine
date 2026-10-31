@@ -14,5 +14,6 @@ requests==2.32.5
 # --- tests (Day 5) ---
 pytest==8.4.2
 httpx==0.28.1
-# real Redis 7 in Docker for tests/test_v2_assess.py (skipped if Docker isn't available)
+# real Redis 7 (and Kafka, Day 18: apache/kafka via the generic container) in Docker for the /v2 tests
+# (skipped if Docker isn't available)
 testcontainers[redis]==4.9.0

@@ -20,3 +20,6 @@ prometheus-client==0.21.1      # GET /metrics/prometheus (Portfolio Day 16)
 # --- /v2: feature store (Day 14) + rules engine (Day 15, yaml.safe_load only) ---
 redis==5.2.1
 PyYAML==6.0.2
+
+# --- feedback loop (Day 18): chargeback.created consumer (librdkafka wheels; KAFKA_ENABLED=false -> never connects) ---
+confluent-kafka==2.6.1

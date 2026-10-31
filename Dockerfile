@@ -21,7 +21,7 @@ RUN python data/generate_data.py --rows 15000 --seed 42 --out data/transactions.
 # ---- runtime ----
 FROM base AS runtime
 RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin risk \
- && mkdir -p /app/logs && chown risk /app/logs
+ && mkdir -p /app/logs /app/data && chown risk /app/logs /app/data
 COPY agent/ agent/
 COPY api/ api/
 COPY risk_v2/ risk_v2/
@@ -29,7 +29,9 @@ COPY model/features.py model/scorer.py model/drift.py model/
 COPY --from=train /app/model/model.pkl /app/model/shadow.pkl /app/model/metrics.json model/
 COPY rules.yaml .
 USER risk
-ENV MODEL_THREADS=1 AUDIT_LOG_PATH=/app/logs/audit_trail.jsonl RULES_PATH=/app/rules.yaml
+# /app/data holds the feedback store (decisions + chargebacks, Day 18): mount a volume there to keep the labels
+ENV MODEL_THREADS=1 AUDIT_LOG_PATH=/app/logs/audit_trail.jsonl RULES_PATH=/app/rules.yaml \
+    FEEDBACK_DB_PATH=/app/data/feedback.db
 EXPOSE 8000
 # liveness only; orchestrators should use GET /ready for traffic (rules, model, Redis, API keys)
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \

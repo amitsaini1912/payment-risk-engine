@@ -29,3 +29,7 @@ DRIFT_PSI = Gauge("risk_drift_psi", "PSI of live /v2 inputs vs training data (up
                   ["model_version", "feature"])
 SHADOW_AGREEMENT = Gauge("risk_shadow_final_action_agreement", "Share of /v2 decisions where the shadow model "
                          "would have led to the same final action", ["champion", "shadow"])
+CHARGEBACK_EVENTS = Counter("risk_chargeback_events_total", "chargeback.created events handled (Day 18)",
+                            ["outcome"])   # stored | duplicate | unmatched | dead_lettered | retried
+FEEDBACK_WRITE_FAILURES = Counter("risk_feedback_write_failures_total",
+                                  "/v2 decisions not kept for the feedback loop (SQLite error); the decision stood")
