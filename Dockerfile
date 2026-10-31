@@ -31,7 +31,7 @@ COPY rules.yaml .
 USER risk
 # /app/data holds the feedback store (decisions + chargebacks, Day 18): mount a volume there to keep the labels
 ENV MODEL_THREADS=1 AUDIT_LOG_PATH=/app/logs/audit_trail.jsonl RULES_PATH=/app/rules.yaml \
-    FEEDBACK_DB_PATH=/app/data/feedback.db
+    FEEDBACK_DB_PATH=/app/data/feedback.db LOG_FORMAT=json
 EXPOSE 8000
 # liveness only; orchestrators should use GET /ready for traffic (rules, model, Redis, API keys)
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \

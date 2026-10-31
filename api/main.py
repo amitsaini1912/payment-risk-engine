@@ -62,13 +62,14 @@ from risk_v2.decisions import DecisionConflict, DecisionStore, request_hash  # n
 from risk_v2.feedback import DAY_MS, LABEL_WINDOW_DAYS, FeedbackLoop, OutcomeStore  # noqa: E402
 from risk_v2.governance import Governance  # noqa: E402
 from risk_v2.rules import RuleBook, RuleLoader, RulesUnavailable  # noqa: E402
-from risk_v2 import tracing  # noqa: E402
+from risk_v2 import json_logs, tracing  # noqa: E402
 from risk_v2.store import FeatureStore, FeaturesUnavailable  # noqa: E402
 from scorer import load_scorer, load_shadow  # noqa: E402
 
 
 install_log_masking()   # every log line, incl. uvicorn's access log: PANs/emails masked (Day 17)
 tracing.setup()         # OTLP export only when OTEL_EXPORTER_OTLP_ENDPOINT is set (Day 20a)
+json_logs.install()     # LOG_FORMAT=json: one JSON object per line incl. trace_id (Day 20b)
 log = logging.getLogger(__name__)
 _consumer: Optional[FeedbackConsumer] = None
 
