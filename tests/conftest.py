@@ -14,6 +14,24 @@ sys.path.insert(0, ROOT)
 for sub in ("agent", "model", "api"):
     sys.path.insert(0, os.path.join(ROOT, sub))
 
+# Day 20a: one in-memory span exporter for the whole test process (OpenTelemetry allows setting the provider once).
+from opentelemetry import trace as _trace  # noqa: E402
+from opentelemetry.sdk.trace import TracerProvider as _TracerProvider  # noqa: E402
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor as _SimpleSpanProcessor  # noqa: E402
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter as _InMemory  # noqa: E402
+
+SPANS = _InMemory()
+_provider = _TracerProvider()
+_provider.add_span_processor(_SimpleSpanProcessor(SPANS))
+_trace.set_tracer_provider(_provider)
+
+
+@pytest.fixture
+def spans():
+    """Finished spans recorded during the test."""
+    SPANS.clear()
+    yield SPANS
+
 
 @pytest.fixture(autouse=True)
 def api_keys():

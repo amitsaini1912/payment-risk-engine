@@ -36,6 +36,7 @@ from pci import mask
 from pydantic import BaseModel, ValidationError
 
 from risk_v2 import metrics as m
+from risk_v2 import tracing
 from risk_v2.feedback import Applied, ChargebackEvent, FeedbackLoop, PaymentOutcomeEvent
 
 log = logging.getLogger(__name__)
@@ -135,6 +136,10 @@ class FeedbackConsumer:
 
     def _handle(self, msg, producer: Producer) -> bool:
         """True = done with this message (commit); False = try again later."""
+        with tracing.consumer_span(msg):   # continues billing's trace from the Kafka headers (Day 20a)
+            return self._handle_traced(msg, producer)
+
+    def _handle_traced(self, msg, producer: Producer) -> bool:
         topic = msg.topic()
         model, handle = self._handlers[topic]
         try:

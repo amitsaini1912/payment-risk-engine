@@ -62,11 +62,13 @@ from risk_v2.decisions import DecisionConflict, DecisionStore, request_hash  # n
 from risk_v2.feedback import DAY_MS, LABEL_WINDOW_DAYS, FeedbackLoop, OutcomeStore  # noqa: E402
 from risk_v2.governance import Governance  # noqa: E402
 from risk_v2.rules import RuleBook, RuleLoader, RulesUnavailable  # noqa: E402
+from risk_v2 import tracing  # noqa: E402
 from risk_v2.store import FeatureStore, FeaturesUnavailable  # noqa: E402
 from scorer import load_scorer, load_shadow  # noqa: E402
 
 
 install_log_masking()   # every log line, incl. uvicorn's access log: PANs/emails masked (Day 17)
+tracing.setup()         # OTLP export only when OTEL_EXPORTER_OTLP_ENDPOINT is set (Day 20a)
 log = logging.getLogger(__name__)
 _consumer: Optional[FeedbackConsumer] = None
 
@@ -96,6 +98,7 @@ app = FastAPI(
     description="Chargeback-risk scoring + LLM reasoning agent with deterministic fallback.",
     lifespan=lifespan,
 )
+tracing.instrument(app)   # server spans; billing's traceparent joins /v2/assess to the payment's trace
 
 
 @app.exception_handler(RequestValidationError)
@@ -372,17 +375,23 @@ def assess_v2(req: AssessV2Request, caller: str = Depends(require_caller),
     except UnsupportedCurrency as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
-        signals = store.observe(transaction_id=req.transaction_id, customer_id=req.customer_id,
-                                card_fingerprint=req.card_fingerprint, device_id=req.device_id,
-                                ip=str(req.ip), amount_inr_minor=inr_minor)
+        with tracing.tracer.start_as_current_span("risk.features"):
+            signals = store.observe(transaction_id=req.transaction_id, customer_id=req.customer_id,
+                                    card_fingerprint=req.card_fingerprint, device_id=req.device_id,
+                                    ip=str(req.ip), amount_inr_minor=inr_minor)
     except FeaturesUnavailable as exc:
         raise _features_unavailable(exc) from exc
     model_input = to_model_transaction(req, signals, inr_minor)
-    verdict = decide(req, signals, model_input, book, llm_fn=explainer, deadline=deadline)
+    with tracing.tracer.start_as_current_span("risk.decide") as span:
+        verdict = decide(req, signals, model_input, book, llm_fn=explainer, deadline=deadline)
+        span.set_attributes({"risk.action": verdict["action"], "risk.path": verdict["path_used"],
+                             "risk.model_version": verdict.get("model_version") or "none",
+                             "risk.rules_version": verdict["rules_version"]})
     decision = {**verdict, "api_version": "v2", "replayed": False, "signals": signals.as_dict(),
                 "model_input": model_input}
     try:
-        kept = decisions.put_first(req.transaction_id, req_hash, decision)
+        with tracing.tracer.start_as_current_span("risk.store"):
+            kept = decisions.put_first(req.transaction_id, req_hash, decision)
     except DecisionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except FeaturesUnavailable as exc:  # decided but can't store it: a retry might differ -> let billing fall back
@@ -391,7 +400,7 @@ def assess_v2(req: AssessV2Request, caller: str = Depends(require_caller),
         m.REPLAYS.inc()
         return {**kept, "replayed": True}
 
-    write_entry({**decision, "caller": caller})
+    write_entry({**decision, "caller": caller, "trace_id": tracing.current_trace_id()})   # audit -> trace (Day 20a)
     _keep_for_feedback(outcomes, decision)
     if decision["model_score"] is not None:
         governance.record(decision, model_input, load_scorer().drift_reference)

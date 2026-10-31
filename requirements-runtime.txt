@@ -23,3 +23,9 @@ PyYAML==6.0.2
 
 # --- feedback loop (Day 18): chargeback.created consumer (librdkafka wheels; KAFKA_ENABLED=false -> never connects) ---
 confluent-kafka==2.6.1
+
+# --- tracing (Day 20a): OTLP export only when OTEL_EXPORTER_OTLP_ENDPOINT is set ---
+opentelemetry-api==1.28.2
+opentelemetry-sdk==1.28.2
+opentelemetry-exporter-otlp-proto-http==1.28.2
+opentelemetry-instrumentation-fastapi==0.49b2

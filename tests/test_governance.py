@@ -52,6 +52,25 @@ def test_a_pan_in_any_field_is_422_and_never_echoed(v2_client, redis_client, fie
     assert redis_client.dbsize() == 0                          # and nothing was recorded
 
 
+# found in the Day 20a traces: billing's payment id f2fdd154-9879-3051-96c0-... was refused (422) as a "card number"
+REAL_UUID = "f2fdd154-9879-3051-96c0-3a2147155a8d"
+
+
+def test_uuids_are_never_card_numbers(v2_client):
+    import uuid
+    assert contains_pan("154-9879-3051-96") is True                                  # the run inside it passes Luhn
+    assert contains_pan(REAL_UUID) is False
+    assert not any(contains_pan(str(uuid.uuid4())) for _ in range(20_000))          # was 0.22%
+    body = post(v2_client, facts(transaction_id=REAL_UUID, customer_id=REAL_UUID.upper()))
+    assert body.status_code == 200
+    assert mask(f"payment {REAL_UUID} card {VISA}") == f"payment {REAL_UUID} card [PAN ****1111]"
+
+
+def test_a_card_number_next_to_a_uuid_is_still_found(v2_client):
+    assert contains_pan(f"{REAL_UUID} {VISA}") is True
+    assert post(v2_client, facts(device_id=f"{REAL_UUID}-{VISA}")).status_code == 422
+
+
 def test_long_numbers_that_are_not_card_numbers_are_fine(v2_client):
     assert post(v2_client, facts(customer_id="cust-4111111111111112")).status_code == 200   # fails Luhn
     assert post(v2_client, facts(customer_id="cust-411111111111")).status_code == 200       # 12 digits

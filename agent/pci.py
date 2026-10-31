@@ -7,7 +7,12 @@ A PAN here = 13-19 digits (optionally separated by single spaces or dashes) that
   - requests: any text field that contains one -> 422, and the error never repeats the value;
   - audit trail + logs: any PAN-looking text is replaced by "[PAN ****1234]" (defence in depth).
 False positives: a long number that happens to pass Luhn (1 in 10), e.g. a 13-digit millisecond timestamp inside an
-id. Ids from billing are UUIDs, so this is acceptable; callers must not embed long numbers in ids.
+id; callers must not embed long numbers in ids.
+
+UUIDs (8-4-4-4-12 hex) are never read as PANs (Day 20a): digit groups joined by dashes inside a UUID, e.g.
+f2fdd154-9879-3051-96c0-... -> "154-9879-3051-96", passed Luhn for 0.22% of random UUIDs. Billing's payment and
+billing account ids are UUIDs, so ~1 payment in 225 was refused (422) and fell back to billing's rules - found
+in the Day 20a traces. A PAN glued to other text (pay_5555..., M3782...) is still found.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from __future__ import annotations
 import re
 
 _CANDIDATE = re.compile(r"(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)")
+_UUID = re.compile(r"(?<![0-9A-Fa-f-])[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?![0-9A-Fa-f-])")
 _EMAIL = re.compile(r"\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
 
 
@@ -29,7 +35,10 @@ def luhn_ok(digits: str) -> bool:
 
 
 def _pans(text: str):
+    uuids = [m.span() for m in _UUID.finditer(text)]
     for m in _CANDIDATE.finditer(text):
+        if any(start <= m.start() and m.end() <= end for start, end in uuids):
+            continue   # digits inside a UUID
         digits = re.sub(r"[ -]", "", m.group(0))
         if 13 <= len(digits) <= 19 and luhn_ok(digits):
             yield m, digits
