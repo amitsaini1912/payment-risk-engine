@@ -84,11 +84,17 @@ def test_any_card_number_in_any_text_is_found_and_masked(pan, before, after, sep
     assert not contains_pan(masked)
 
 
-@given(st.uuids(), NO_DIGITS)
-def test_uuids_are_never_card_numbers(value, around):
-    text = f"{around}{value}{around}"
+@given(st.uuids(), NO_DIGITS, st.sampled_from(["", "-"]))
+def test_uuids_are_never_card_numbers(value, around, dash):
+    text = f"{around}{dash}{value}{dash}{around}"      # Day 22: "dev-<uuid>" was missed (NO_DIGITS has no dash)
     assert not contains_pan(text) and not contains_pan(str(value).upper())
     assert str(value) in mask(text)                                            # masking leaves it alone
+
+
+@given(st.binary(min_size=32, max_size=32))
+def test_sha256_hex_digests_are_never_card_numbers(raw):
+    # Day 22: card-vault fingerprints; 0.44% of them were read as a PAN
+    assert not contains_pan(raw.hex()) and not contains_pan(f"fp {raw.hex()}.")
 
 
 @given(st.text(alphabet="0123456789", max_size=12), NO_DIGITS)

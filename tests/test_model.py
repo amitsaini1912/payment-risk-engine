@@ -107,3 +107,52 @@ def test_serving_uses_one_job_per_model():
     from scorer import MODEL_THREADS
     for _name, step in load_scorer(MODEL_PATH).pipeline.steps:
         assert getattr(step, "n_jobs", MODEL_THREADS) == MODEL_THREADS
+
+
+# ---- Day 22: fast forest inference (the engine's largest cost per decision, found by the k6 load test) ----
+
+DATA_PATH = os.path.join(ROOT, "data", "transactions.csv")
+
+
+@pytest.mark.skipif(not os.path.exists(DATA_PATH), reason="data/transactions.csv not generated")
+def test_fast_forest_gives_sklearns_scores_on_all_training_rows():
+    import numpy as np
+    from scorer import _forest_proba
+    scorer = load_scorer(MODEL_PATH)
+    assert scorer.fast_forest is True                      # the shipped model takes the fast path
+    raw = pd.read_csv(DATA_PATH).drop(columns=["is_chargeback"], errors="ignore")
+    frame = scorer.engineer(raw.to_dict("records"))
+    X = frame[MODEL_FEATURES]
+    expected = scorer.pipeline.predict_proba(X)[:, 1]
+    got = _forest_proba(scorer.pipeline.steps[-1][1], scorer.pipeline[:-1].transform(X))[:, 1]
+    assert np.abs(expected - got).max() < 1e-9
+    assert np.allclose(scorer.score_engineered(frame.head(500)), expected[:500], rtol=0, atol=1e-9)
+
+
+def test_fast_path_only_for_a_plain_random_forest():
+    import numpy as np
+    from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression
+    from scorer import _fast_forest_ok
+    X, y = np.random.default_rng(1).normal(size=(200, 4)), np.arange(200) % 2
+    assert _fast_forest_ok(RandomForestClassifier(n_estimators=5, random_state=0).fit(X, y)) is True
+    assert _fast_forest_ok(ExtraTreesClassifier(n_estimators=5, random_state=0).fit(X, y)) is False
+    assert _fast_forest_ok(LogisticRegression().fit(X, y)) is False
+
+
+def test_fast_forest_can_be_switched_off(monkeypatch):
+    import numpy as np
+    from sklearn.ensemble import RandomForestClassifier
+    from scorer import _fast_forest_ok
+    X, y = np.random.default_rng(1).normal(size=(200, 4)), np.arange(200) % 2
+    monkeypatch.setenv("MODEL_FAST_FOREST", "false")
+    assert _fast_forest_ok(RandomForestClassifier(n_estimators=5, random_state=0).fit(X, y)) is False
+
+
+def test_engineered_once_equals_engineered_per_call(sample_transaction):
+    scorer = load_scorer(MODEL_PATH)
+    other = dict(sample_transaction, amount=99_000.0, is_new_device=1)
+    frame = scorer.engineer([sample_transaction, other])
+    assert scorer.score_engineered(frame.iloc[[0]]) == scorer.score_batch([sample_transaction])
+    assert scorer.score_engineered(frame)[1] == scorer.score_batch([other])[0]
+    assert scorer.feature_snapshot(sample_transaction, frame.iloc[[0]]) == scorer.feature_snapshot(sample_transaction)

@@ -10,6 +10,7 @@ import os
 from functools import lru_cache
 
 import joblib
+import numpy as np
 import pandas as pd
 from threadpoolctl import threadpool_limits  # ships with scikit-learn
 
@@ -51,6 +52,7 @@ class Scorer:
         self.model_version: str = bundle.get("model_version", f"{self.model_name}-unversioned")
         self.role: str = bundle.get("role", "champion")
         self.drift_reference: dict = bundle.get("drift_reference", {})
+        self.fast_forest: bool = _fast_forest_ok(self.pipeline.steps[-1][1])
 
     def _validate(self, txn: dict) -> None:
         missing = [f for f in REQUIRED_RAW_FIELDS if f not in txn or txn[f] is None]
@@ -80,17 +82,33 @@ class Scorer:
 
     def score_batch(self, txns: list[dict]) -> list[float]:
         """Score several transactions in one model call (same cost as one). Raises ScoringError on bad input."""
+        return self.score_engineered(self.engineer(txns))
+
+    def engineer(self, txns: list[dict]) -> pd.DataFrame:
+        """Validated raw transactions -> engineered frame (all columns). Row by row, so a row's features don't depend
+        on the rest of the batch: one frame can be reused for the shadow model and the snapshot (Day 22)."""
         for txn in txns:
             self._validate(txn)
         try:
-            engineered = engineer_features(pd.DataFrame(txns))[MODEL_FEATURES]
-            return [float(p) for p in self.pipeline.predict_proba(engineered)[:, 1]]
+            return engineer_features(pd.DataFrame(txns))
         except Exception as exc:  # noqa: BLE001 - any transform failure = bad input
             raise ScoringError(f"could not score transactions: {exc}") from exc
 
-    def feature_snapshot(self, txn: dict) -> dict:
-        """Human-readable derived features, for the LLM prompt and audit log."""
-        engineered = engineer_features(pd.DataFrame([txn])).iloc[0]
+    def score_engineered(self, engineered: pd.DataFrame) -> list[float]:
+        """P(chargeback) per row of an engineer() frame."""
+        try:
+            X = engineered[MODEL_FEATURES]
+            if not self.fast_forest:
+                return [float(p) for p in self.pipeline.predict_proba(X)[:, 1]]
+            Xt = self.pipeline[:-1].transform(X) if len(self.pipeline) > 1 else X
+            return [float(p) for p in _forest_proba(self.pipeline.steps[-1][1], Xt)[:, 1]]
+        except Exception as exc:  # noqa: BLE001 - any transform failure = bad input
+            raise ScoringError(f"could not score transactions: {exc}") from exc
+
+    def feature_snapshot(self, txn: dict, engineered: pd.DataFrame | None = None) -> dict:
+        """Human-readable derived features, for the LLM prompt and audit log. `engineered`: txn's engineer() row,
+        if the caller has it already."""
+        engineered = (engineered if engineered is not None else engineer_features(pd.DataFrame([txn]))).iloc[0]
         keys = [
             "amount", "amount_to_avg_ratio", "account_age_days",
             "historical_chargeback_rate", "past_chargebacks", "txn_count_1h",
@@ -108,6 +126,38 @@ def _plain(v):
         return int(f) if f.is_integer() else round(f, 4)
     except (TypeError, ValueError):
         return str(v)
+
+
+def _forest_proba(forest, X) -> np.ndarray:
+    """RandomForestClassifier.predict_proba without scikit-learn's per-tree Python overhead (Day 22 load test).
+
+    sklearn predicts tree by tree through joblib + input checks: ~33 us per tree, 9.8 ms for our 300 trees on one
+    row - the largest single cost of a /v2 decision, and the engine has one worker. Calling each tree's compiled
+    predict directly = the same arithmetic (average of per-tree class fractions) in ~3 ms."""
+    X = np.ascontiguousarray(X.toarray() if hasattr(X, "toarray") else X, dtype=np.float32)
+    total = np.zeros((X.shape[0], forest.n_classes_))
+    for tree in forest.estimators_:
+        p = tree.tree_.predict(X).reshape(X.shape[0], -1)[:, :forest.n_classes_]
+        norm = p.sum(axis=1, keepdims=True)
+        norm[norm == 0] = 1.0
+        total += p / norm
+    return total / len(forest.estimators_)
+
+
+def _fast_forest_ok(model) -> bool:
+    """Use _forest_proba only for a plain single-output random forest, and only if it gives sklearn's answer on
+    random inputs (a different sklearn version changing tree internals -> back to sklearn, never wrong scores)."""
+    from sklearn.ensemble import RandomForestClassifier
+    if os.environ.get("MODEL_FAST_FOREST", "true").lower() == "false" or type(model) is not RandomForestClassifier \
+            or getattr(model, "n_outputs_", 1) != 1:
+        return False
+    try:
+        rng = np.random.default_rng(22)
+        X = rng.normal(0, 3, size=(256, model.n_features_in_)).astype(np.float32)
+        X[::4] = rng.integers(0, 2, size=X[::4].shape)               # 0/1 columns too (one-hot)
+        return bool(np.allclose(_forest_proba(model, X), model.predict_proba(X), rtol=0, atol=1e-9))
+    except Exception:  # noqa: BLE001 - anything unexpected: use sklearn
+        return False
 
 
 @lru_cache(maxsize=1)

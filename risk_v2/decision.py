@@ -38,7 +38,7 @@ def decide(facts, signals, model_input: dict, book: RuleBook,
     reasons = [{"code": code, "source": "rule", "rule": f.id, "detail": f.detail}
                for f in fired for code in f.reasons]
 
-    model_score = review_at = None
+    model_score = review_at = engineered = None
     model_version = None
     contributions: dict[str, float] = {}
     features: dict = {}
@@ -47,8 +47,17 @@ def decide(facts, signals, model_input: dict, book: RuleBook,
         scorer = load_scorer()
         review_at = scorer.threshold
         model_version = scorer.model_version
-        model_score, contributions = score_with_contributions(scorer.score_batch, model_input)
-        features = scorer.feature_snapshot(model_input)
+        # features engineered ONCE (Day 22): the contribution batch's first row is model_input itself; the snapshot
+        # and the shadow model reuse it instead of rebuilding the pandas frame (~4 ms each on one worker)
+        frames: list = []
+
+        def score_and_keep(txns: list[dict]) -> list[float]:
+            frames.append(scorer.engineer(txns))
+            return scorer.score_engineered(frames[-1])
+
+        model_score, contributions = score_with_contributions(score_and_keep, model_input)
+        engineered = frames[0].iloc[[0]] if frames else None     # None: contributions computed elsewhere (tests)
+        features = scorer.feature_snapshot(model_input, engineered)
     except (ScoringError, FileNotFoundError):
         failure_mode = "model_unavailable"
     block_at = max(book.policy.block_at, review_at or 0)
@@ -71,7 +80,7 @@ def decide(facts, signals, model_input: dict, book: RuleBook,
                         "detail": f"score {model_score:.3f} >= {review_at}"})
 
     codes = list(dict.fromkeys(r["code"] for r in reasons))
-    shadow = _shadow(model_input, fired, band_of, deadline) if model_score is not None else None
+    shadow = _shadow(model_input, fired, band_of, deadline, engineered) if model_score is not None else None
     try:
         explanation, explanation_source, llm_failure = explain(
             action, reasons, model_score, review_at, block_at, llm_fn=llm_fn,
@@ -106,7 +115,7 @@ def decide(facts, signals, model_input: dict, book: RuleBook,
     return result
 
 
-def _shadow(model_input: dict, fired, band_of, deadline: Optional[Deadline]) -> Optional[dict]:
+def _shadow(model_input: dict, fired, band_of, deadline: Optional[Deadline], engineered=None) -> Optional[dict]:
     """Score with the shadow model, if there is one and there's time. Any error -> recorded, never raised."""
     try:
         shadow = load_shadow()
@@ -117,7 +126,9 @@ def _shadow(model_input: dict, fired, band_of, deadline: Optional[Deadline]) -> 
     if deadline is not None and deadline.left_for_optional_work() < SHADOW_MIN_S:
         return {"model_version": shadow.model_version, "skipped": "no budget left"}
     try:
-        score = round(shadow.score_batch([model_input])[0], 4)
+        # any object with score_batch can be a shadow; the shared frame is only an optimisation
+        reuse = engineered is not None and hasattr(shadow, "score_engineered")
+        score = round((shadow.score_engineered(engineered) if reuse else shadow.score_batch([model_input]))[0], 4)
     except Exception as exc:  # noqa: BLE001
         return {"model_version": shadow.model_version, "skipped": f"shadow failed: {type(exc).__name__}"}
     shadow_band = band_of(score, shadow.threshold)

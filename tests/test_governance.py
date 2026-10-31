@@ -20,6 +20,7 @@ from v2_support import facts
 
 AFTERNOON_IST = "2026-10-29T08:30:00+00:00"
 VISA = "4111111111111111"
+MASTERCARD = "5555555555554444"
 
 
 def post(client, body):
@@ -64,6 +65,55 @@ def test_uuids_are_never_card_numbers(v2_client):
     body = post(v2_client, facts(transaction_id=REAL_UUID, customer_id=REAL_UUID.upper()))
     assert body.status_code == 200
     assert mask(f"payment {REAL_UUID} card {VISA}") == f"payment {REAL_UUID} card [PAN ****1111]"
+
+
+# found by the Day 22 load test: billing sent X-Device-Id "dev-<uuid>"; the dash before the UUID hid it from the
+# UUID rule and "6047-1682-4885-9" inside it passed Luhn -> 422 -> the payment fell back to billing's rules
+PREFIXED = "dev-f14f6047-1682-4885-9abc-0bf3b5c4e9be"
+
+
+def test_uuids_with_a_prefix_or_suffix_are_not_card_numbers(v2_client):
+    assert contains_pan("6047-1682-4885-9") is True                                  # the run inside it passes Luhn
+    for value in (PREFIXED, f"android-{REAL_UUID}", f"{REAL_UUID}-v2", f"x-{REAL_UUID}-y"):
+        assert contains_pan(value) is False, value
+    assert post(v2_client, facts(device_id=PREFIXED)).status_code == 200
+
+
+def test_a_card_number_joined_to_a_uuid_by_a_dash_is_still_found(v2_client):
+    assert contains_pan(f"{VISA}-{REAL_UUID}") is True
+    assert contains_pan(f"dev-{REAL_UUID}-{VISA}") is True
+    assert post(v2_client, facts(device_id=f"{VISA}-{REAL_UUID}")).status_code == 422
+
+
+# found by the Day 22 load test: card-vault's fingerprint of a random test card; "65357899197801886" inside it passes
+# Luhn, so every payment on that card got 422 and fell back to billing's rules (0.44% of random fingerprints)
+FINGERPRINT = "a6bc59a65357899197801886d9436ddd7491fefc61f4e366fdd0cd3e9160d383"
+
+
+def test_card_fingerprints_are_never_card_numbers(v2_client):
+    import os
+    assert contains_pan("65357899197801886") is True
+    assert contains_pan(FINGERPRINT) is False
+    assert not any(contains_pan(os.urandom(32).hex()) for _ in range(20_000))        # was 0.44%
+    assert post(v2_client, facts(card_fingerprint=FINGERPRINT)).status_code == 200
+    assert mask(f"fp {FINGERPRINT}") == f"fp {FINGERPRINT}"
+
+
+def test_only_a_whole_sha256_hex_token_is_skipped(v2_client):
+    assert contains_pan("a" * 47 + VISA) is True                  # 63 chars: not a digest
+    assert contains_pan(FINGERPRINT + "0") is True                # 65 chars: not a digest
+    assert contains_pan(FINGERPRINT.upper()) is True              # card-vault writes lowercase
+    assert contains_pan(f"{FINGERPRINT} {VISA}") is True          # a PAN next to it
+    assert post(v2_client, facts(card_fingerprint=FINGERPRINT[:40] + "x" + FINGERPRINT[41:])).status_code == 422
+
+
+def test_a_card_number_after_another_number_is_found_and_masked(v2_client):
+    # before Day 22 only the whole digit run was checked: "12 4111111111111111" = 18 digits, fails Luhn -> missed
+    for text in (f"order 12 {VISA}", f"order-12-{VISA}", f"{VISA} {MASTERCARD}", f"ref 383 4111 1111 1111 1111"):
+        assert contains_pan(text) is True, text
+        assert "1111111111" not in mask(text).replace(" ", "").replace("-", ""), mask(text)
+    assert mask(f"{VISA} {MASTERCARD}") == "[PAN ****1111] [PAN ****4444]"
+    assert post(v2_client, facts(device_id=f"dev-12-{VISA}")).status_code == 422
 
 
 def test_a_card_number_next_to_a_uuid_is_still_found(v2_client):
