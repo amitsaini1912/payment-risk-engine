@@ -28,3 +28,6 @@ model/candidate/
 .DS_Store
 .idea/
 .vscode/
+
+# hypothesis example database (Day 21): local, regenerated
+.hypothesis/

@@ -17,3 +17,5 @@ httpx==0.28.1
 # real Redis 7 (and Kafka, Day 18: apache/kafka via the generic container) in Docker for the /v2 tests
 # (skipped if Docker isn't available)
 testcontainers[redis]==4.9.0
+# property-based tests (Day 21): generated inputs + shrinking, tests/test_properties.py
+hypothesis==6.118.8
