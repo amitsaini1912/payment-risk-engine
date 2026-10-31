@@ -1,5 +1,5 @@
 """
-Live demo dashboard for the Razorpay Risk Agent.
+Live demo dashboard for the Payment Risk Engine.
 
   streamlit run dashboard/app.py
 
@@ -36,7 +36,7 @@ API_URL = os.environ.get("API_URL", "http://localhost:8000")
 # /assess and /audit need a key since Day 16: one of the RISK_API_KEYS (the "dashboard:" one)
 HEADERS = {"X-API-Key": os.environ.get("RISK_API_KEY", "")}
 
-st.set_page_config(page_title="Razorpay Risk Agent", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Payment Risk Engine", page_icon="🛡️", layout="wide")
 
 # --------------------------------------------------------------------------
 # Backend: API if reachable, else in-process
@@ -151,7 +151,7 @@ FAILURE_LABEL = {
 # Layout
 # --------------------------------------------------------------------------
 
-st.title("🛡️ Razorpay Risk Agent — live demo")
+st.title("🛡️ Payment Risk Engine — live demo")
 
 health = _api_alive()
 col_a, col_b = st.columns([3, 2])

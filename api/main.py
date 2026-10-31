@@ -94,7 +94,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    title="Razorpay Risk Agent",
+    title="Payment Risk Engine",
     version="1.0.0",
     description="Chargeback-risk scoring + LLM reasoning agent with deterministic fallback.",
     lifespan=lifespan,

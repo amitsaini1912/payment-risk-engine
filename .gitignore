@@ -31,3 +31,8 @@ model/candidate/
 
 # hypothesis example database (Day 21): local, regenerated
 .hypothesis/
+
+# Day 24a: coverage output (CI uploads it as an artifact)
+.coverage
+coverage.xml
+htmlcov/

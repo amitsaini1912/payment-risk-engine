@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/amitsaini1912/razorpay-risk-agent/docs/contracts/chargeback.created.v1.schema.json",
+  "$id": "https://github.com/amitsaini1912/payment-risk-engine/docs/contracts/chargeback.created.v1.schema.json",
   "title": "chargeback.created v1",
   "description": "billing-service -> Kafka topic `chargeback.created` -> risk engine (docs/adr/0005). Message value = this JSON (UTF-8), message key = transaction_id. Unknown fields are ignored by the consumer (adding an optional field is not a breaking change); a breaking change gets schema_version 2.",
   "type": "object",

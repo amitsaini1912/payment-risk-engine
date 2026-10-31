@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Day 24a: lint + tests + coverage. Tests use Testcontainers (Redis, Kafka): the ubuntu runner has Docker.
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      # The model tests are SKIPPED when model/model.pkl is missing (it's gitignored): build it here, the same way
+      # the Dockerfile does, so CI really runs them.
+      - name: Generate data and train the model
+        run: |
+          python data/generate_data.py --rows 15000 --seed 42 --out data/transactions.csv
+          python model/train.py
+
+      - name: Tests (with coverage)
+        run: >
+          python -m pytest -q -rs
+          --cov=agent --cov=api --cov=risk_v2 --cov=model
+          --cov-report=term --cov-report=xml --cov-report=html
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          [ -f coverage.xml ] || { echo "no coverage report"; exit 0; }
+          line=$(python -c "import xml.etree.ElementTree as e; r=e.parse('coverage.xml').getroot(); print(f\"lines {100*float(r.get('line-rate')):.1f}% ({r.get('lines-covered')}/{r.get('lines-valid')})\")")
+          echo "**payment-risk-engine** coverage: $line" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=coverage::$line"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: htmlcov/
+          if-no-files-found: ignore

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/amitsaini1912/razorpay-risk-agent/docs/contracts/payment.outcome.v1.schema.json",
+  "$id": "https://github.com/amitsaini1912/payment-risk-engine/docs/contracts/payment.outcome.v1.schema.json",
   "title": "payment.outcome v1",
   "description": "billing-service -> Kafka topic `payment.outcome` -> risk engine (docs/adr/0006). What happened to a payment after the risk decision: it was captured (money moved, so it CAN charge back), or a person approved / rejected a held payment. Message value = this JSON (UTF-8), key = transaction_id. Unknown fields are ignored; a breaking change gets schema_version 2.",
   "type": "object",

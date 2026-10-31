@@ -1,5 +1,5 @@
 """
-Synthetic transaction data generator for the Razorpay AI Risk Manager project.
+Synthetic transaction data generator for the payment risk engine (started for the Razorpay AI Buildathon, AI Risk Manager track).
 
 Why synthetic (not a scraped / public dataset):
   * Full control over the signal we bury in the data, so we can prove the model

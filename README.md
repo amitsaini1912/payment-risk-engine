@@ -1,137 +1,137 @@
-# Razorpay Risk Agent
+<div align="center">
 
-**Razorpay AI Buildathon — AI Risk Manager track.**
+# Payment Risk Engine
 
-A chargeback-risk system in three layers: a classical ML **risk scorer**, an LLM
-**reasoning agent** that turns the score into an action and a plain-English
-justification, and a deterministic **rule-based fallback** that takes over
-whenever the LLM path fails. Every decision is written to an audit trail, and
-the whole thing is driven from a live dashboard.
+**A real-time card-payment risk check: velocity features in Redis, explainable rules with reason codes, a
+cost-tuned ML model, a 300 ms budget, and a feedback loop that learns from chargebacks.**
 
----
+[![CI](https://github.com/amitsaini1912/payment-risk-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/amitsaini1912/payment-risk-engine/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.128-009688?logo=fastapi&logoColor=white)
+![scikit-learn](https://img.shields.io/badge/scikit--learn-1.6-F7931E?logo=scikitlearn&logoColor=white)
 
-**Demo video:** https://drive.google.com/file/d/10b1Q4O3ro8oGWHSt1Qu3MaBtCnVIqIvw/view?usp=sharing
+</div>
 
-## The problem, and why it's real
+It decides, before a card is charged, whether a payment should go through (`allow`), wait for a human
+(`hold_for_review`) or stop (`block`), and says why in reason codes a reviewer can act on. Its caller is the
+billing service of [patient-management-microservices](https://github.com/amitsaini1912/patient-management-microservices),
+which never charges a card the engine (or its own fallback rules) didn't allow.
 
-The AI Risk Manager track asks for an agent that assesses transaction risk,
-decides an action, and handles failure gracefully. Chargebacks are the sharp end
-of that:
+It started at the Razorpay AI Buildathon (AI Risk Manager track) as a scorer + LLM agent + dashboard (`/assess`,
+still here) and grew into the `/v2/assess` service below.
 
-A card-not-present payment is approved in milliseconds, but for weeks afterwards
-the cardholder can dispute it. When they do, the money is pulled back from the
-merchant, a dispute fee is charged on top, and the payment gateway wears the
-operational cost and the network scrutiny. For a PSP operating at Razorpay's
-scale, basis points of chargeback rate are a large absolute number.
+## The problem
 
-What makes it a genuine ML problem rather than a checkbox:
+A card-not-present payment is approved in milliseconds, but the cardholder can dispute it for weeks. A chargeback
+pulls the money back, adds a dispute fee, and costs operations time; card networks penalise merchants whose
+chargeback rate stays high. A risk check has to:
 
-- **Severe class imbalance.** Real chargeback rates are ~2–8%, not 50/50. A
-  model that predicts "never fraud" is already ~95% accurate and worthless.
-- **Asymmetric costs.** A missed chargeback costs the transaction amount + fees;
-  a false alarm costs a few minutes of analyst time. The decision threshold is a
-  business trade-off, not a default.
-- **Reviewers need reasons.** A fraud analyst acting on a flag needs to know
-  *why* it fired — which is why the scorer is a tree model and the agent emits an
-  explanation.
-- **It has to stay up.** A risk check sits in the payment path. If the LLM is
-  slow, down, or wrong, the transaction still needs a verdict *now*.
+- decide **before** the network is asked, inside the caller's time budget (here 300 ms), every time;
+- see what a single payment can't: **velocity** (how many payments on this card / by this customer in the last
+  hour), new devices, a card shared across devices;
+- be **explainable**: a held payment needs a reason a reviewer understands, not just a score;
+- never be the reason payments stop: when it is slow or down, the caller must have a safe default;
+- **learn**: chargebacks arriving weeks later must become training labels.
 
-## Architecture
+## How a decision is made
 
-```
-                       data/generate_data.py
-                    (synthetic txns + planted
-                       fraud patterns, ~15k)
-                               │
-                               ▼
-                        model/train.py
-             LogReg → RandomForest → HistGradientBoosting
-             pick best by PR-AUC · cost-based threshold
-                               │
-                               ▼
-                        model/model.pkl
-                  (sklearn pipeline + threshold)
-                               │
-        ┌──────────────────────┼───────────────────────┐
-        │           agent/reasoning_agent.assess()      │
-        │                      │                        │
-        │        1. score  ──► model.pkl                │
-        │        2. ask LLM (Gemini) for                │
-        │           {action, explanation, confidence}   │
-        │           · hard ~8s timeout                  │
-        │           · strict JSON-schema validation     │
-        │                      │                        │
-        │            success   │   any failure          │
-        │              ▼       │       ▼                │
-        │        LLM verdict   │   agent/fallback_rules │
-        │                      │   (score bands +       │
-        │                      │    hard rules,         │
-        │                      │    no dependencies)    │
-        │                      ▼                        │
-        │              agent/audit.py  ──► logs/audit_trail.jsonl
-        └──────────────────────┬───────────────────────┘
-                               │
-              ┌────────────────┴─────────────────┐
-              ▼                                  ▼
-      api/main.py  (FastAPI)            dashboard/app.py  (Streamlit)
-   POST /assess · GET /audit/{id}       submit · simulate failures ·
-   GET /audit · /metrics · /health      live audit table · model metrics
+```mermaid
+flowchart LR
+    B[billing-service] -->|"POST /v2/assess<br/>facts only: amount, token, fingerprint,<br/>customer, device, IP (no card number)"| G[PAN guard<br/>422 if any field holds a card number]
+    G --> V[velocity snapshot<br/>Redis, one Lua script<br/>card / customer / device / IP counts]
+    V --> R[rules.yaml<br/>9 rules -> action + reason codes]
+    V --> M[ML model<br/>RandomForest, cost-tuned threshold<br/>+ per-reason contributions]
+    R --> D{strictest action wins}
+    M --> D
+    D --> E[explanation<br/>template, or LLM if configured and time is left]
+    D --> S[shadow model scored too<br/>never decides]
+    E --> O[stored decision<br/>same transaction_id = same answer]
+    O --> B
 ```
 
-## Quickstart
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as billing-service
+    participant E as risk engine
+    participant R as Redis
+    B->>E: POST /v2/assess (X-API-Key, facts, payment id as transaction_id)
+    E->>R: already decided this transaction_id? (same facts hash)
+    alt replay
+        R-->>E: stored decision
+    else new
+        E->>R: velocity.lua: read history BEFORE this payment, then record it (atomic)
+        E->>E: rules + model + contributions, strictest action, reason codes
+        E->>R: SET NX the decision (25 h)
+    end
+    E-->>B: action, reason_codes, score, model/rules versions, explanation
+    Note over B,E: billing gives the whole call 300 ms (1 retry, circuit breaker),<br/>engine slow or down -> billing's own fallback rules
+```
 
-Runs end to end on a clean clone. Python 3.9+.
+The feedback loop: billing publishes `chargeback.created` and `payment.outcome` (captured, review approved / rejected)
+to Kafka through its outbox. The engine's consumer stores them next to the decision, so precision and recall are
+measured on real outcomes (`GET /feedback/performance`), and `scripts/retrain.py` (default `--population captured`)
+retrains on payments that were really captured, with their real labels.
+
+## What it guarantees — and the evidence
+
+| Guarantee | How | Evidence |
+|---|---|---|
+| Same question, same answer | decisions stored by `transaction_id` + request hash (different facts = 409) | ADR 0003, replay tests |
+| Velocity counts are exact under concurrency | one Redis Lua script reads and records atomically | hypothesis model test (`test_properties.py`) |
+| Explainable | 12 reason codes from rules and from the model's per-feature contributions | ADR 0002 |
+| Within budget | deadline per request; optional work (LLM wording, shadow) skipped when time runs out | ADR 0003 |
+| No card numbers in, none logged | Luhn-based PAN guard on every field (422, value never echoed); log + audit masking | ADR 0004, ADR 0010 (3 false-positive / masking bugs found under load and fixed) |
+| Safe model changes | versioned models, shadow model on live traffic, PSI drift per feature | `GET /governance/shadow`, `/governance/drift` (ADR 0004) |
+| Learns from outcomes | Kafka consumer (own DLT), labels by `transaction_id` | ADR 0005, 0006 |
+
+Load (k6, same laptop as billing's tests): one worker answered every check up to **30 payments/s** after a profiling
+fix cut CPU per decision from ~45 ms to ~23 ms (forest inference without scikit-learn's per-tree overhead, features
+computed once); see ADR 0010 and billing's `docs/PERFORMANCE.md`.
+
+## Run it
 
 ```bash
-git clone <this-repo> && cd razorpay-risk-agent
+python3.12 -m venv venv && venv/bin/pip install -r requirements.txt
+venv/bin/python data/generate_data.py --rows 15000 --seed 42 --out data/transactions.csv
+venv/bin/python model/train.py                 # model.pkl + shadow.pkl + metrics.json
 
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+docker run -d -p 6379:6379 redis:7.4-alpine
+RISK_API_KEYS=billing:dev-key-0123456789 venv/bin/uvicorn api.main:app --port 8000
 
-# 1. generate the dataset (deterministic, ~15k rows, ~6% chargebacks)
-python data/generate_data.py --rows 15000 --seed 42 --out data/transactions.csv
-
-# 2. train the model + choose the cost-based threshold
-python model/train.py                 # -> model/model.pkl, model/metrics.json
-python model/threshold_analysis.py    # -> cost-vs-threshold report + plot
-
-# 3. run the tests
-pytest -q                             # 36 tests, no skips once model.pkl exists
-
-# 4. (optional) enable the live LLM path
-cp .env.example .env && echo 'GEMINI_API_KEY=your-key' >> .env
-
-# 5. launch the demo (API on :8000, dashboard on :8501)
-./run.sh
-# then open http://localhost:8501
+curl -s localhost:8000/v2/assess -H 'X-API-Key: dev-key-0123456789' -H 'Content-Type: application/json' -d '{
+  "transaction_id":"pay-1","amount_minor":150000,"currency":"INR","card_token":"tok_abcdefgh23",
+  "card_fingerprint":"fp0123456789abcdef","last4":"4242","customer_id":"cust-1","merchant_id":"M1001",
+  "ip":"203.0.113.7","device_id":"dev-1","timestamp":"'"$(date -Iseconds)"'"}'
+# -> "action":"allow", "reason_codes":["R04_NEW_ACCOUNT","R03_NEW_DEVICE"], "model_score":0.0965, "decided_in_ms":23.7 ...
 ```
 
-Without a `GEMINI_API_KEY` everything still works — the agent logs
-`failure_mode: "llm_unavailable"` and uses the deterministic fallback.
+As a container: `docker build -t payment-risk-engine .` (trains the model during the build). With the whole payments
+system: billing's `docker-compose.yml` builds this repo from `../payment-risk-engine`.
 
-## Repo layout
+| Endpoint | |
+|---|---|
+| `POST /v2/assess` | the decision (API key) |
+| `GET /health`, `GET /ready` | liveness; readiness (keys, rules, model and Redis usable) |
+| `GET /metrics/prometheus` | latency histogram, decisions, 503s, budget overruns, drift |
+| `GET /governance/shadow`, `GET /governance/drift` | champion vs shadow agreement; PSI per feature |
+| `GET /feedback/performance`, `GET /feedback/{id}` | precision / recall on real outcomes; one decision's outcome |
+| `POST /assess`, `GET /audit`, `GET /audit/{id}` | v1 (buildathon): score + LLM agent + rule fallback, audit trail |
 
+Configuration: `RISK_API_KEYS` (`caller:key,...`, required), `REDIS_URL`, `RISK_BUDGET_MS` (300),
+`KAFKA_ENABLED` / `KAFKA_BOOTSTRAP_SERVERS` (feedback consumer), `GEMINI_API_KEY` (optional LLM wording),
+`OTEL_EXPORTER_OTLP_ENDPOINT` (tracing), `LOG_FORMAT=json`, `MODEL_FAST_FOREST` (default true).
+
+## Tests
+
+```bash
+venv/bin/python -m pytest -q        # 253 tests (Testcontainers: Redis, Kafka), ~70 s
+venv/bin/ruff check .
+venv/bin/python -m pytest -q --cov=agent --cov=api --cov=risk_v2 --cov=model   # 92% of lines
 ```
-data/generate_data.py       synthetic transaction generator
-data/transactions.csv       generated dataset (committed, regenerable)
-model/features.py           shared feature engineering (train == inference)
-model/train.py              model selection + cost-based threshold
-model/threshold_analysis.py standalone cost-vs-threshold analysis
-model/scorer.py             load model.pkl, validate + score one transaction
-model/model.pkl             saved pipeline (gitignored — run train.py)
-model/metrics.json          all metrics for every candidate + the selected model
-agent/reasoning_agent.py    assess(): score → LLM → validate → fallback → log
-agent/llm_client.py         Gemini wrapper, key-optional
-agent/fallback_rules.py     deterministic score-band + hard-rule engine
-agent/audit.py              append-only JSONL audit trail + readers
-agent/failure_sim.py        named failure simulators (CLI + dashboard)
-api/main.py                 FastAPI service
-dashboard/app.py            Streamlit demo dashboard
-logs/audit_trail.jsonl      decision log (gitignored — sample below)
-tests/                      model, fallback-path, and API tests
-run.sh                      start API + dashboard together
-```
+
+CI (GitHub Actions) lints, generates the data, trains the model (so the model tests really run), and runs the tests
+with coverage on every push.
 
 ## Data
 
@@ -200,181 +200,52 @@ are dropped from the CSV by default so they cannot leak the label; pass
 
 ## Model
 
-Baseline-first: Logistic Regression → Random Forest → HistGradientBoosting, all
-class-balanced. Selected by best average precision (PR-AUC) on a stratified 20%
-held-out test set — **HistGradientBoosting**, AP ≈ 0.46, ROC-AUC ≈ 0.92.
+Three class-balanced candidates (logistic regression, random forest, histogram gradient boosting) are trained on a
+60/20/20 split. **Selection = the lowest expected rupee cost on the validation set at its own tuned threshold**;
+the test set is only used for the numbers below. Feature engineering (`model/features.py`) is shared by training
+and serving, so the two can't drift apart.
 
-Feature engineering lives in `model/features.py` and is imported by both
-training and inference, so the transformation can't drift between them.
-
-### Cost-based decision threshold
-
-`model/threshold_analysis.py` sweeps every threshold and computes total expected
-rupee cost:
+### Cost-based threshold
 
 | Mistake | Cost |
 |---------|------|
 | Missed chargeback (FN) | transaction amount + ₹1,500 dispute fee + ₹500 ops |
-| False alarm (FP) | ₹400 manual review + friction |
+| False alarm (FP) | ₹400 manual review |
 
-The **unconstrained** cost minimum is threshold ≈ 0.27 (recall 0.95, precision
-0.28). Manual-review capacity is finite and precision below ~30% wastes reviewer
-time, so we impose a **0.30 precision floor**. The cost-minimising threshold
-under that constraint is **≈ 0.42**, costing only ~8% more than the unconstrained
-optimum. That is the number we ship — and it's a defensible sentence, not a
-guess.
+The threshold minimises that cost on the validation set, subject to a **precision floor of 0.30**: review capacity
+is finite, and below ~30% reviewers mostly look at good payments.
 
-### Metrics at the shipped threshold (≈ 0.42)
+### Shipped model (seed 42, `model/metrics.json`)
 
-| Metric | Value |
-|--------|-------|
-| Recall | **≈ 0.92** (acceptance bar ≥ 0.75) |
-| Precision | ≈ 0.31 |
-| F1 | ≈ 0.47 |
-| Confusion (test, n = 3000) | TP 184 · FP 404 · **FN 15** · TN 2397 |
-| Expected cost | ≈ ₹88 / txn vs ≈ ₹936 / txn if we approve everything (−91%) |
+| | |
+|---|---|
+| Selected | random forest (300 trees), version `rf-b677801468`; shadow: logistic regression |
+| Threshold | 0.404 (unconstrained cost minimum 0.345 had validation precision 0.29) |
+| Test set (n = 3,000, 166 chargebacks) | recall **0.81**, precision 0.29, PR-AUC 0.41, ROC-AUC 0.91 |
+| Confusion | TP 135 · FP 324 · FN 31 · TN 2,510 |
+| Expected cost | **₹102 / payment** vs ₹713 approving everything (−86%) and ₹378 reviewing everything |
 
-Top drivers (permutation importance): `amount`, `historical_chargeback_rate`,
-`amount_to_avg_ratio`, `txn_count_1h`, `past_chargebacks`,
-`ip_billing_country_mismatch`. A tree model is used partly so a flag can be
-explained by naming these inputs — a neural net would not give that, and this
-dataset (15k rows, tabular) is exactly where trees win.
+A tree model partly because a flag must be explainable: the per-reason contributions (score minus the score with
+that reason's inputs made normal) become the model's reason codes.
 
-Full numbers: `model/metrics.json`. Cost curve: `model/threshold_cost_curve.png`.
-(Exact figures move slightly if you regenerate the data with a different seed.)
+## v1: the buildathon agent
 
-## Reasoning agent
+`POST /assess` scores a transaction, lets an LLM reasoning agent (Gemini) choose the action and write a
+justification, and falls back to deterministic rules whenever the LLM fails or times out (`agent/`, `dashboard/`).
+Every v1 decision is written to an audit trail. The dashboard: `venv/bin/streamlit run dashboard/app.py`.
 
-`agent/reasoning_agent.assess(transaction)` is the single entry point:
+## Decisions
 
-1. Score the transaction with the model.
-2. Send the score + derived risk features to **Gemini** (`gemini-flash-lite`,
-   ~1–2s) and ask for a structured verdict — `{action, explanation, confidence}`,
-   `action ∈ {allow, hold_for_review, block}`. The LLM **decides**; it is not a
-   chatbot. It falls through a list of model ids if one is deprecated/overloaded.
-3. Enforce a hard ~8s wall-clock timeout (daemon thread — a hung call cannot
-   block the decision path).
-4. Validate the JSON against a strict schema (`action` enum, non-empty
-   explanation, numeric confidence).
-5. On **any** failure, fall back to `agent/fallback_rules.py` — score bands
-   anchored on the cost-based threshold (review ≥ 0.42, block ≥ 0.80) plus hard
-   rules (≥3 prior chargebacks → block, stolen-card signature → block,
-   card-testing → review). No external dependencies, so it can't fail the way
-   the LLM path can.
-6. Log every decision to `logs/audit_trail.jsonl`.
+`docs/adr/` — 10 records: the v2 contract (0001), rules and reason codes (0002), production behaviour
+(idempotency, budget, auth, readiness: 0003), PCI and model governance (0004), the feedback loop (0005, 0006),
+tracing + the first PAN false positive (0007, amended by 0010), JSON logs (0008), property-based tests (0009), load-test findings (0010).
+`docs/contracts/` — JSON schemas of the Kafka events billing sends.
 
-`assess()` never raises.
+## Known limitations
 
-### Enabling the LLM
-
-```
-cp .env.example .env       # then set GEMINI_API_KEY (or GOOGLE_API_KEY)
-```
-
-`.env` is gitignored. Config: `GEMINI_MODEL` (default `gemini-flash-lite-latest`),
-`GEMINI_FALLBACK_MODELS` (comma-separated).
-
-## API + dashboard
-
-```bash
-./run.sh                                  # API :8000 + dashboard :8501
-# or separately:
-uvicorn api.main:app --port 8000
-streamlit run dashboard/app.py            # works stand-alone (in-process fallback)
-```
-
-**FastAPI** (`api/main.py`):
-
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /assess` | validate body → verdict → log. Bad body → `422`. |
-| `POST /assess?simulate=<mode>` | force a failure mode through the real pipeline (demo) |
-| `GET /audit/{transaction_id}` | the logged decision (`404` if none) |
-| `GET /audit?limit=` | recent decisions |
-| `GET /metrics` | Day-2 model metrics |
-| `GET /health` | liveness + whether the LLM is configured |
-
-**Streamlit dashboard** (`dashboard/app.py`) — the primary demo surface:
-
-| Panel | What it shows |
-|-------|---------------|
-| Assess a transaction | Preset + editable form → live verdict, LLM explanation, score, path, latency |
-| Simulate a failure | One button per failure mode — forced through the real pipeline, fallback verdict shown on screen, no crash |
-| Audit trail | Live table of recent decisions (time, score, path, failure_mode, action) |
-| Sidebar | Model recall / precision / F1 / threshold / confusion matrix / cost-per-txn |
-
-## Failure handling
-
-Three distinct failure classes — a dependency problem, a bad-output problem, and
-a bad-input problem — each with a dedicated test in `tests/test_failure_modes.py`
-and a one-click dashboard simulation.
-
-| # | Failure | Detection | Response | `failure_mode` logged |
-|---|---------|-----------|----------|-----------------------|
-| 1 | LLM call times out / API unreachable / not configured | wall-clock timeout; connection/SDK exception | deterministic fallback | `llm_timeout` · `llm_error` · `llm_unavailable` |
-| 2 | LLM returns malformed / non-JSON / off-schema output | JSON parse fails, or `action` not in enum, or confidence not numeric | deterministic fallback | `llm_malformed` |
-| 3 | Missing / corrupt input field | `scorer` validation raises `ScoringError` before the LLM is called | fallback → conservative `hold_for_review` | `bad_input` |
-
-Beyond these: a retired Gemini model id (falls through a model list), and an
-audit-log write failure (caught, logged to stderr, never breaks the decision).
-
-Run all simulations from the CLI: `python agent/failure_sim.py all`
-
-## Audit trail
-
-Every decision (LLM or fallback) is appended to `logs/audit_trail.jsonl`
-(gitignored). Sample entry — an LLM timeout that fell back to the rule engine:
-
-```json
-{
-  "logged_at": "2026-08-30T16:38:47.246751+00:00",
-  "transaction_id": "TXN-SIM-LLM_TIMEOUT",
-  "model_score": 0.9396,
-  "threshold": 0.4237,
-  "path_used": "fallback",
-  "failure_mode": "llm_timeout",
-  "action": "block",
-  "explanation": "Deterministic fallback (llm_timeout). Action: BLOCK. IP/billing country mismatch + new device on a high-value order; model score 0.940 -> band 'block' (review>=0.42, block>=0.8).",
-  "confidence": 0.61,
-  "rules_fired": ["IP/billing country mismatch + new device on a high-value order", "model score 0.940 -> band 'block'"],
-  "feature_snapshot": { "amount": 12500, "historical_chargeback_rate": 0.25, "...": "..." },
-  "error_detail": "no response within 2.0s"
-}
-```
-
-Who reads it: a compliance reviewer, a support agent handling a disputed
-payment, or an incident post-mortem.
-
-## Testing
-
-```bash
-pytest -q
-```
-
-- `tests/test_model.py` — model loads, scores a known low- and high-risk
-  transaction correctly, rejects bad input, feature engineering is pure, saved
-  metrics meet the acceptance bar.
-- `tests/test_failure_modes.py` — each of the 3 fallback paths triggers under
-  simulated failure and produces a valid logged verdict; `assess()` never
-  raises whatever the LLM does; the LLM happy path works via an injected fake.
-- `tests/test_api.py` — normal request returns a valid verdict, 7 kinds of
-  malformed request return `422`, audit round-trip, `simulate` forces fallback.
-
-API tests run offline (the LLM is monkeypatched to unavailable) so the suite is
-deterministic and needs no key.
-
-## Scoped out (and what I'd do with more time)
-
-- **No feature store / real-time aggregation.** `txn_count_1h` etc. are columns
-  in the dataset; in production they'd come from a streaming aggregation keyed on
-  customer/card. First thing I'd add — it's where most of the signal is.
-- **Threshold is fixed at train time.** Real systems re-fit it as the fraud mix
-  and review-team capacity change; I'd make it a monitored, re-tunable parameter.
-- **The LLM is trusted within the schema.** It can't return an invalid action,
-  but it *could* return a confident, well-formed, wrong explanation. I'd add a
-  consistency check (does the explanation cite features that actually moved the
-  score?) and sample LLM verdicts for human audit.
-- **Single model, no drift monitoring.** I'd track score distribution and
-  realised chargeback rate over time and alert on drift.
-- **Fallback rules are hand-tuned.** They're deliberately simple; with more data
-  I'd calibrate the bands and hard-rule thresholds rather than set them by hand.
+- One uvicorn worker per container: scale with replicas. More processes per container need Prometheus multiprocess
+  mode and a real database for the feedback store (SQLite today).
+- Synthetic training data (patterns are planted, so the model's numbers say it learns them, not that it would catch
+  real fraud). The feedback loop is the path to real labels.
+- Model artefacts are pickles trained at build time; no model registry.
+- Accepted PAN-guard blind spot: a card number hidden inside an exactly-64-hex-character token.

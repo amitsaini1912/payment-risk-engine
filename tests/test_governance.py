@@ -109,7 +109,7 @@ def test_only_a_whole_sha256_hex_token_is_skipped(v2_client):
 
 def test_a_card_number_after_another_number_is_found_and_masked(v2_client):
     # before Day 22 only the whole digit run was checked: "12 4111111111111111" = 18 digits, fails Luhn -> missed
-    for text in (f"order 12 {VISA}", f"order-12-{VISA}", f"{VISA} {MASTERCARD}", f"ref 383 4111 1111 1111 1111"):
+    for text in (f"order 12 {VISA}", f"order-12-{VISA}", f"{VISA} {MASTERCARD}", "ref 383 4111 1111 1111 1111"):
         assert contains_pan(text) is True, text
         assert "1111111111" not in mask(text).replace(" ", "").replace("-", ""), mask(text)
     assert mask(f"{VISA} {MASTERCARD}") == "[PAN ****1111] [PAN ****4444]"
