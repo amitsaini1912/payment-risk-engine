@@ -36,4 +36,8 @@ EXPOSE 8000
 # liveness only; orchestrators should use GET /ready for traffic (rules, model, Redis, API keys)
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
   CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# ADR 0011: WEB_CONCURRENCY worker processes (uvicorn reads it as --workers). Metrics are added up across them through
+# PROMETHEUS_MULTIPROC_DIR, which must start empty: a restarted container must not count the old workers' values.
+# All workers share /app/data/feedback.db (SQLite WAL) and Redis; each runs its own Kafka consumer (one group).
+ENV WEB_CONCURRENCY=4 PROMETHEUS_MULTIPROC_DIR=/tmp/risk-metrics
+CMD ["sh", "-c", "rm -rf \"$PROMETHEUS_MULTIPROC_DIR\" && mkdir -p \"$PROMETHEUS_MULTIPROC_DIR\" && exec uvicorn api.main:app --host 0.0.0.0 --port 8000"]

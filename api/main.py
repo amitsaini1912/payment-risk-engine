@@ -37,7 +37,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -76,7 +76,8 @@ _consumer: Optional[FeedbackConsumer] = None
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Load the model and rules before the first request: the first payment must not pay ~1 s of joblib load."""
+    """Load the model and rules before the first request: the first payment must not pay ~1 s of joblib load.
+    (Scoring a synthetic payment as well was measured on 2026-11-01 and changed nothing - ADR 0011.)"""
     for warm in (load_scorer, get_rule_loader().get):
         try:
             warm()
@@ -488,7 +489,7 @@ def prometheus_metrics(governance: Governance = Depends(get_governance)) -> Resp
                     report["final_action_agreement"])
     except Exception:  # noqa: BLE001 - Redis or model trouble shows in /ready; metrics still served
         pass
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    return Response(m.exposition(), media_type=CONTENT_TYPE_LATEST)
 
 
 def _require_outcomes(outcomes: Optional[OutcomeStore] = Depends(get_outcome_store)) -> OutcomeStore:

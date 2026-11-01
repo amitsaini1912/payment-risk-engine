@@ -87,7 +87,8 @@ retrains on payments that were really captured, with their real labels.
 
 Load (k6, same laptop as billing's tests): one worker answered every check up to **30 payments/s** after a profiling
 fix cut CPU per decision from ~45 ms to ~23 ms (forest inference without scikit-learn's per-tree overhead, features
-computed once); see ADR 0010 and billing's `docs/PERFORMANCE.md`.
+computed once); see ADR 0010 and billing's `docs/PERFORMANCE.md`. The image now runs **4 workers** (ADR 0011): the
+engine alone held **80 checks/s at p99 140 ms** (one worker: 40/s at p99 196 ms, collapsed at 60/s).
 
 ## Run it
 
@@ -245,8 +246,8 @@ tracing + the first PAN false positive (0007, amended by 0010), JSON logs (0008)
 
 ## Known limitations
 
-- One uvicorn worker per container: scale with replicas. More processes per container need Prometheus multiprocess
-  mode and a real database for the feedback store (SQLite today).
+- 4 workers per container share one SQLite feedback store (ADR 0011); more than one CONTAINER needs a shared database
+  (Postgres) - each container has its own file.
 - Synthetic training data (patterns are planted, so the model's numbers say it learns them, not that it would catch
   real fraud). The feedback loop is the path to real labels.
 - Model artefacts are pickles trained at build time; no model registry.
