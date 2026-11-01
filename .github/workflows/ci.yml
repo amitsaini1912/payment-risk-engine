@@ -33,9 +33,24 @@ jobs:
 
       - name: Tests (with coverage)
         run: >
-          python -m pytest -q -rs
+          python -m pytest -q -rfs --junitxml=test-results.xml
           --cov=agent --cov=api --cov=risk_v2 --cov=model
           --cov-report=term --cov-report=xml --cov-report=html
+
+      # A failed test becomes an annotation (title = test name, text = the assertion): readable on the run page and
+      # through the public API without opening the log. Added after a 1-in-14 flake whose name we couldn't see.
+      - name: Report failed tests
+        if: failure()
+        run: |
+          [ -f test-results.xml ] || exit 0
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          for case in ET.parse("test-results.xml").getroot().iter("testcase"):
+              for bad in list(case.findall("failure")) + list(case.findall("error")):
+                  name = f"{case.get('classname')}.{case.get('name')}"
+                  text = " ".join((bad.get("message") or bad.text or "").split())[:900]
+                  print(f"::error title=FAILED {name}::{text}")
+          PY
 
       - name: Coverage summary
         if: always()

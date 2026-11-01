@@ -34,5 +34,8 @@ model/candidate/
 
 # Day 24a: coverage output (CI uploads it as an artifact)
 .coverage
+# per-process data files (tests that start subprocesses under pytest-cov, tests/test_workers.py)
+.coverage.*
 coverage.xml
+test-results.xml
 htmlcov/
