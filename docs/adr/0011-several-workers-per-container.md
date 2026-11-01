@@ -41,7 +41,8 @@ What stood in the way (ADR 0010): metrics are per process, and the feedback stor
 - Per-process state is now per worker: rules hot reload (each worker stats the file), the LLM pool (4 slots per
   worker), in-process caches. Behaviour is the same, the limits multiply.
 - Several CONTAINERS still need a shared feedback database (Postgres): each container has its own SQLite file.
-- The billing checkout k6 test was not repeated with 4 workers (only the engine alone).
+- Billing's checkout k6 step test, re-run 2026-11-01 with 4 workers: all 8,324 payments risk-checked by the engine up
+  to 40 checkouts/s (one worker: 72%), 0 fallback decisions (billing's `docs/PERFORMANCE.md`).
 - Tests: `tests/test_workers.py` (4, real processes): a scrape adds up two workers' counters and histograms and takes
   the latest gauge; without the directory a scrape is this process only; 4 processes append whole audit lines; 4
   processes write 400 decisions to one SQLite file, all kept.
