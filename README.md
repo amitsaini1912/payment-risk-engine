@@ -239,6 +239,16 @@ that reason's inputs made normal) become the model's reason codes.
 justification, and falls back to deterministic rules whenever the LLM fails or times out (`agent/`, `dashboard/`).
 Every v1 decision is written to an audit trail. The dashboard: `venv/bin/streamlit run dashboard/app.py`.
 
+How it grew (see the commit history):
+
+| When | Stage | What was added |
+|---|---|---|
+| Aug 2026 | **ML basics** (buildathon) | synthetic data generator with fraud patterns, logistic regression / random forest / gradient boosting compared on PR-AUC, cost-based threshold instead of 0.5 |
+| Aug–Sep 2026 | **Serving it** | Gemini LLM agent with rule fallback on timeout / bad JSON, FastAPI + Pydantic validation (422 on bad input), Streamlit dashboard, pytest suite |
+| Oct 2026 | **Production service** (`/v2`) | Redis velocity features (atomic Lua), YAML rules with reason codes, idempotent stored decisions, 300 ms budget, API keys, PCI-aware logs, Prometheus |
+| Oct–Nov 2026 | **Model operations** | train/validation/test split (fixed a leak), shadow model + PSI drift, Kafka chargeback feedback loop and retraining, OpenTelemetry |
+| Nov 2026 | **Performance** | profiled 45 → 23 ms CPU per decision, 4 workers: 100% of checkout payments risk-checked up to 40/s |
+
 ## Decisions
 
 `docs/adr/` — 10 records: the v2 contract (0001), rules and reason codes (0002), production behaviour
